@@ -576,3 +576,153 @@ func BenchmarkPolynomialEvaluate(b *testing.B) {
 		_ = p.Evaluate(uint8(i))
 	}
 }
+
+func TestGF256Div_NegativeDiff(t *testing.T) {
+	// When logA < logB the diff goes negative before the +255 correction.
+	// Use a=2 (log=1) and b=4 (log=2) so diff = 1-2 = -1 → +255 = 254.
+	gf := NewGF256()
+	result := gf.Div(2, 4)
+	// 2/4 in GF(256) = 2 * Inv(4); verify via Mul round-trip
+	inv4 := gf.Inv(4)
+	expected := gf.Mul(2, inv4)
+	if result != expected {
+		t.Errorf("Div(2,4): got %d want %d", result, expected)
+	}
+}
+
+func TestGF256Inv_Zero(t *testing.T) {
+	gf := NewGF256()
+	// Inv(0) is defined as 0 by convention (no multiplicative inverse)
+	if gf.Inv(0) != 0 {
+		t.Errorf("Inv(0) should be 0, got %d", gf.Inv(0))
+	}
+}
+
+func TestGF256Div_ZeroDividend(t *testing.T) {
+	gf := NewGF256()
+	if gf.Div(0, 5) != 0 {
+		t.Error("0 / anything should be 0")
+	}
+}
+
+func TestGF256Div_PanicOnZeroDivisor(t *testing.T) {
+	gf := NewGF256()
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("Div by zero should panic")
+		}
+	}()
+	gf.Div(1, 0)
+}
+
+func TestNewPolynomial_DegreeZeroError(t *testing.T) {
+	gf := NewGF256()
+	_, err := gf.NewPolynomial(42, 0)
+	if err == nil {
+		t.Fatal("NewPolynomial with degree=0 should return error")
+	}
+}
+
+func TestPolynomial_EvaluateAtZero(t *testing.T) {
+	// Evaluate(0) should return the intercept (constant term)
+	gf := NewGF256()
+	poly, err := gf.NewPolynomial(0xAB, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if poly.Evaluate(0) != 0xAB {
+		t.Errorf("Evaluate(0) should equal intercept 0xAB, got %d", poly.Evaluate(0))
+	}
+}
+
+func TestShamirSplit_TooManyParts(t *testing.T) {
+	s := NewShamir()
+	_, err := s.Split([]byte("secret"), 256, 2)
+	if err == nil {
+		t.Fatal("parts > 255 should error")
+	}
+}
+
+func TestShamirSplit_ThresholdAbove255(t *testing.T) {
+	s := NewShamir()
+	// threshold > 255 — use 256 cast to int; parts must be >= threshold
+	// Note: parts capped at 255 so this triggers threshold > 255 check
+	_, err := s.Split([]byte("secret"), 255, 256)
+	if err == nil {
+		t.Fatal("threshold > 255 should error")
+	}
+}
+
+func TestShamirSplit_ThresholdLessThan2(t *testing.T) {
+	s := NewShamir()
+	_, err := s.Split([]byte("secret"), 3, 1)
+	if err == nil {
+		t.Fatal("threshold < 2 should error")
+	}
+}
+
+func TestShamirSplit_EmptySecret(t *testing.T) {
+	s := NewShamir()
+	_, err := s.Split([]byte{}, 3, 2)
+	if err == nil {
+		t.Fatal("empty secret should error")
+	}
+}
+
+func TestShamirCombine_MismatchedLengths(t *testing.T) {
+	s := NewShamir()
+	shares := []*Share{
+		{X: 1, Y: []byte{0x01, 0x02}},
+		{X: 2, Y: []byte{0x03}}, // wrong length
+	}
+	_, err := s.Combine(shares)
+	if err == nil {
+		t.Fatal("mismatched Y lengths should error")
+	}
+}
+
+func TestShamirDeserialize_MinimalValid(t *testing.T) {
+	s := NewShamir()
+	// 2 bytes: 1 x-coord + 1 y-value
+	sh, err := s.DeserializeShare([]byte{0x05, 0xAB})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sh.X != 0x05 || sh.Y[0] != 0xAB {
+		t.Fatalf("wrong share: X=%d Y=%v", sh.X, sh.Y)
+	}
+}
+
+func TestShamirSerializeRoundtrip_AllBytes(t *testing.T) {
+	s := NewShamir()
+	// All 256 possible byte values as a secret
+	secret := make([]byte, 256)
+	for i := range secret {
+		secret[i] = byte(i)
+	}
+	shares, err := s.Split(secret, 5, 3)
+	if err != nil {
+		t.Fatalf("Split: %v", err)
+	}
+
+	// Serialize and deserialize all shares
+	roundtripped := make([]*Share, len(shares))
+	for i, sh := range shares {
+		data := s.SerializeShare(sh)
+		rt, err := s.DeserializeShare(data)
+		if err != nil {
+			t.Fatalf("DeserializeShare %d: %v", i, err)
+		}
+		roundtripped[i] = rt
+	}
+
+	recovered, err := s.Combine(roundtripped[:3])
+	if err != nil {
+		t.Fatalf("Combine: %v", err)
+	}
+	for i, b := range recovered {
+		if b != secret[i] {
+			t.Fatalf("byte %d: got %d want %d", i, b, secret[i])
+		}
+	}
+}

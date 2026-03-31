@@ -49,8 +49,6 @@ func cipherCompliance(t *testing.T, c Cipher) {
 	}
 }
 
-// ── XChacha20Cipher ────────────────────────────────────────────────────────
-
 func TestXChacha20_InterfaceCompliance(t *testing.T) {
 	c, err := NewCipher("test-secret-key")
 	if err != nil {
@@ -276,6 +274,41 @@ func TestKDFThenCipher(t *testing.T) {
 	if !bytes.Equal(got, secret) {
 		t.Fatal("pipeline round-trip failed")
 	}
+}
+
+func TestXChacha20_NilCipherEncrypt(t *testing.T) {
+	var c *XChacha20Cipher
+	_, err := c.Encrypt([]byte("data"))
+	if err == nil {
+		t.Fatal("Encrypt on nil cipher must return error")
+	}
+}
+
+func TestXChacha20_NilCipherDecrypt(t *testing.T) {
+	var c *XChacha20Cipher
+	_, err := c.Decrypt([]byte("data"))
+	if err == nil {
+		t.Fatal("Decrypt on nil cipher must return error")
+	}
+}
+
+func TestXChacha20_UninitializedAEAD(t *testing.T) {
+	c := &XChacha20Cipher{aead: nil}
+	_, errEnc := c.Encrypt([]byte("x"))
+	_, errDec := c.Decrypt([]byte("x"))
+	if errEnc == nil || errDec == nil {
+		t.Fatal("uninitialized aead must return errors")
+	}
+}
+
+func TestNewCipher_Base64WrongLength(t *testing.T) {
+	// Valid base64 but only 16 bytes — must fall back to SHA-256 hash path
+	b64Short := "AAAAAAAAAAAAAAAAAAAAAA==" // 16 zero bytes in base64
+	c, err := NewCipher(b64Short)
+	if err != nil {
+		t.Fatalf("should succeed via hash fallback: %v", err)
+	}
+	cipherCompliance(t, c)
 }
 
 func TestErrDecryptSentinel(t *testing.T) {

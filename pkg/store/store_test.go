@@ -6,6 +6,8 @@ import (
 	"testing"
 )
 
+// ── helpers ───────────────────────────────────────────────────────────────
+
 func tempStore(t *testing.T) (*BoltStore, func()) {
 	t.Helper()
 	dir := t.TempDir()
@@ -15,6 +17,8 @@ func tempStore(t *testing.T) (*BoltStore, func()) {
 	}
 	return s, func() { s.Close() }
 }
+
+// ── Store interface compliance ─────────────────────────────────────────────
 
 func TestStore_InterfaceCompliance(t *testing.T) {
 	s, cleanup := tempStore(t)
@@ -50,6 +54,8 @@ func TestClose_Idempotent(t *testing.T) {
 	// make sure it doesn't panic
 	_ = s.Close()
 }
+
+// ── Update / View ─────────────────────────────────────────────────────────
 
 func TestUpdate_CreateBucket(t *testing.T) {
 	s, cleanup := tempStore(t)
@@ -162,6 +168,8 @@ func TestUpdate_Rollback(t *testing.T) {
 		return nil
 	})
 }
+
+// ── Bucket operations ──────────────────────────────────────────────────────
 
 func TestBucket_GetMissing(t *testing.T) {
 	s, cleanup := tempStore(t)
@@ -338,6 +346,154 @@ func TestBucket_NilForMissingTopLevel(t *testing.T) {
 		return nil
 	})
 }
+
+// ── OpenWithOptions ────────────────────────────────────────────────────────
+
+func TestOpenWithOptions_Valid(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "opts.db")
+
+	s, err := OpenWithOptions(path, nil) // nil opts → bbolt defaults
+	if err != nil {
+		t.Fatalf("OpenWithOptions: %v", err)
+	}
+	defer s.Close()
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("database file not created: %v", err)
+	}
+}
+
+func TestOpenWithOptions_BadPath(t *testing.T) {
+	_, err := OpenWithOptions("/nonexistent/deep/path/keeper.db", nil)
+	if err == nil {
+		t.Fatal("expected error opening db in nonexistent directory")
+	}
+}
+
+func TestOpen_BadPath(t *testing.T) {
+	_, err := Open("/nonexistent/deep/path/keeper.db")
+	if err == nil {
+		t.Fatal("expected error for bad path")
+	}
+}
+
+// ── Error propagation ──────────────────────────────────────────────────────
+
+func TestUpdate_PropagatesError(t *testing.T) {
+	s, cleanup := tempStore(t)
+	defer cleanup()
+
+	sentinel := os.ErrPermission
+	err := s.Update(func(tx Tx) error { return sentinel })
+	if err != sentinel {
+		t.Fatalf("expected sentinel error, got: %v", err)
+	}
+}
+
+func TestView_PropagatesError(t *testing.T) {
+	s, cleanup := tempStore(t)
+	defer cleanup()
+
+	sentinel := os.ErrPermission
+	err := s.View(func(tx Tx) error { return sentinel })
+	if err != sentinel {
+		t.Fatalf("expected sentinel error, got: %v", err)
+	}
+}
+
+// ── ForEach: error propagation ────────────────────────────────────────────
+
+func TestBucket_ForEach_StopsOnError(t *testing.T) {
+	s, cleanup := tempStore(t)
+	defer cleanup()
+
+	_ = s.Update(func(tx Tx) error {
+		b, _ := tx.CreateBucketIfNotExists([]byte("kv"))
+		_ = b.Put([]byte("a"), []byte("1"))
+		_ = b.Put([]byte("b"), []byte("2"))
+		return nil
+	})
+
+	sentinel := os.ErrInvalid
+	count := 0
+	err := s.View(func(tx Tx) error {
+		b := tx.Bucket([]byte("kv"))
+		return b.ForEach(func(k, v []byte) error {
+			count++
+			return sentinel
+		})
+	})
+	if err != sentinel {
+		t.Fatalf("expected sentinel, got: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("ForEach should stop after first error, count=%d", count)
+	}
+}
+
+func TestTx_ForEach_StopsOnError(t *testing.T) {
+	s, cleanup := tempStore(t)
+	defer cleanup()
+
+	_ = s.Update(func(tx Tx) error {
+		_, _ = tx.CreateBucketIfNotExists([]byte("b1"))
+		_, _ = tx.CreateBucketIfNotExists([]byte("b2"))
+		return nil
+	})
+
+	sentinel := os.ErrInvalid
+	err := s.View(func(tx Tx) error {
+		return tx.ForEach(func(_ []byte, _ Bucket) error {
+			return sentinel
+		})
+	})
+	if err != sentinel {
+		t.Fatalf("Tx.ForEach should propagate error: %v", err)
+	}
+}
+
+// ── CreateBucketIfNotExists: duplicate nested ──────────────────────────────
+
+func TestBucket_CreateBucketIfNotExists_Idempotent(t *testing.T) {
+	s, cleanup := tempStore(t)
+	defer cleanup()
+
+	// Create the same nested bucket twice — must succeed both times
+	for i := 0; i < 2; i++ {
+		err := s.Update(func(tx Tx) error {
+			parent, _ := tx.CreateBucketIfNotExists([]byte("parent"))
+			_, err := parent.CreateBucketIfNotExists([]byte("child"))
+			return err
+		})
+		if err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+	}
+}
+
+// ── Put then overwrite ─────────────────────────────────────────────────────
+
+func TestBucket_PutOverwrite(t *testing.T) {
+	s, cleanup := tempStore(t)
+	defer cleanup()
+
+	_ = s.Update(func(tx Tx) error {
+		b, _ := tx.CreateBucketIfNotExists([]byte("kv"))
+		_ = b.Put([]byte("k"), []byte("v1"))
+		return b.Put([]byte("k"), []byte("v2"))
+	})
+
+	_ = s.View(func(tx Tx) error {
+		b := tx.Bucket([]byte("kv"))
+		if string(b.Get([]byte("k"))) != "v2" {
+			t.Error("overwrite did not take effect")
+		}
+		return nil
+	})
+}
+
+// ── DB() escape hatch ──────────────────────────────────────────────────────
 
 func TestBoltStore_DBAccessor(t *testing.T) {
 	s, cleanup := tempStore(t)
