@@ -28,6 +28,8 @@ var (
 	ErrSecurityDowngrade  = errors.New("security downgrade requires explicit confirmation")
 	ErrRotationIncomplete = errors.New("incomplete key rotation detected: call Rotate again with the new passphrase")
 	ErrAdminNotFound      = errors.New("admin ID not found in bucket policy")
+	ErrPolicySignature    = errors.New("policy signature verification failed")
+	ErrMetadataDecrypt    = errors.New("metadata decryption failed")
 )
 
 const (
@@ -39,25 +41,19 @@ const (
 	schemeSeparator    = "://"
 	auditBucketRoot    = "__audit__"
 	auditSnapshotEvery = 1000
+
+	currentSaltVersion = 1
+	minArgon2Memory    = 64 * 1024
+	argon2TimeCost     = 3
+	argon2Parallelism  = 4
 )
 
-// SecurityLevel defines the key-management model for a bucket.
 type SecurityLevel string
 
 const (
-	// LevelPasswordOnly — bucket uses the database master key directly.
-	// Suitable for system/vault:// buckets that must be available at startup
-	// without human interaction.
 	LevelPasswordOnly SecurityLevel = "password_only"
-
-	// LevelAdminWrapped — bucket uses a random DEK wrapped by a KEK derived
-	// from HKDF(masterKey + adminPassword + salt).
-	// Suitable for keeper:// user buckets that require admin presence to unlock.
-	// Multiple admins are supported via per-admin wrapped copies of the DEK.
 	LevelAdminWrapped SecurityLevel = "admin_wrapped"
-
-	// LevelHSM — reserved for future external HSM/KMS integration.
-	LevelHSM SecurityLevel = "hsm"
+	LevelHSM          SecurityLevel = "hsm"
 )
 
 // SchemeHandler allows custom pre/post processing per scheme.
@@ -77,22 +73,15 @@ type Hooks struct {
 
 // Config holds all configuration for a Keeper instance.
 type Config struct {
-	DBPath           string
-	KeyLen           int
-	AutoLockInterval time.Duration // only affects LevelAdminWrapped buckets
-	EnableAudit      bool
-	DefaultScheme    string
-	DefaultNamespace string
-	Logger           *ll.Logger
-
-	// KDF is used by DeriveMaster. Defaults to crypt.DefaultArgon2KDF() when nil.
-	KDF crypt.KDF
-
-	// NewCipher produces a Cipher from a raw key.
-	// Defaults to crypt.NewCipherFromKey (XChaCha20-Poly1305) when nil.
-	NewCipher func(key []byte) (crypt.Cipher, error)
-
-	// Argon2 parameters for the master-key verification hash.
+	DBPath                  string
+	KeyLen                  int
+	AutoLockInterval        time.Duration
+	EnableAudit             bool
+	DefaultScheme           string
+	DefaultNamespace        string
+	Logger                  *ll.Logger
+	KDF                     crypt.KDF
+	NewCipher               func(key []byte) (crypt.Cipher, error)
 	Argon2Time              uint32
 	Argon2Memory            uint32
 	Argon2Parallelism       uint8
@@ -103,12 +92,20 @@ type Config struct {
 
 // Secret is the encrypted record stored for each key.
 type Secret struct {
-	Ciphertext  []byte    `json:"ct"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
-	AccessCount int       `json:"access_count"`
-	LastAccess  time.Time `json:"last_access,omitempty"`
-	Version     int       `json:"version"`
+	Ciphertext    []byte    `json:"ct"`
+	EncryptedMeta []byte    `json:"em,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	AccessCount   int       `json:"access_count"`
+	LastAccess    time.Time `json:"last_access,omitempty"`
+	Version       int       `json:"version"`
+}
+
+type EncryptedMetadata struct {
+	CreatedAt   time.Time `json:"ca"`
+	UpdatedAt   time.Time `json:"ua"`
+	AccessCount int       `json:"ac"`
+	LastAccess  time.Time `json:"la,omitempty"`
 }
 
 type NamespaceStats struct {
@@ -148,41 +145,26 @@ type SchemeStats struct {
 	TotalSize  int64            `json:"total_size"`
 }
 
-// Add to types.go after existing constants
-
 // SaltEntry represents a versioned salt for passphrase derivation.
 type SaltEntry struct {
-	Version   int       `json:"version"`
-	Salt      []byte    `json:"salt"`
-	CreatedAt time.Time `json:"created_at"`
-	Active    bool      `json:"active"` // Only one salt active at a time
+	Version   int       `json:"v"`
+	Salt      []byte    `json:"s"`
+	CreatedAt time.Time `json:"ca"`
+	KeyLen    int       `json:"kl"`
 }
 
 // RotationWAL tracks the state of key rotation for crash recovery.
 type RotationWAL struct {
-	Status     string    `json:"status"`       // "in_progress", "committing", "completed"
-	OldKeyHash []byte    `json:"old_key_hash"` // SHA-256 of old master key
-	NewKeyHash []byte    `json:"new_key_hash"` // SHA-256 of new master key
-	StartedAt  time.Time `json:"started_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
-	// Shadow writes: track which keys have shadow copies
-	ShadowKeys []ShadowEntry `json:"shadow_keys,omitempty"`
-}
-
-// ShadowEntry tracks a shadow-written secret during rotation.
-type ShadowEntry struct {
-	Scheme      string `json:"scheme"`
-	Namespace   string `json:"namespace"`
-	Key         string `json:"key"`
-	HasShadow   bool   `json:"has_shadow"`   // New ciphertext written
-	OldVerified bool   `json:"old_verified"` // Old ciphertext verified
+	Status      string    `json:"status"`
+	OldKeyHash  []byte    `json:"old_hash"`
+	NewKeyHash  []byte    `json:"new_hash"`
+	StartedAt   time.Time `json:"started"`
+	ShadowKeys  []string  `json:"shadows"`
+	SaltVersion int       `json:"salt_ver"`
 }
 
 // EncryptedMetadata contains encrypted secret metadata.
-type EncryptedMetadata struct {
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
-	AccessCount int       `json:"access_count"`
-	LastAccess  time.Time `json:"last_access,omitempty"`
-	Version     int       `json:"version"`
+type SignedPolicy struct {
+	Policy    []byte `json:"policy"`
+	Signature []byte `json:"sig"`
 }
