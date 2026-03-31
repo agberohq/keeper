@@ -1,9 +1,8 @@
-// Package audit provides append-only tamper-evident audit chain storage.
-// It depends only on store.Store and has no keeper or bbolt import.
 package audit
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -26,6 +25,7 @@ type Event struct {
 	Timestamp    time.Time `json:"timestamp"`
 	PrevChecksum string    `json:"prev_checksum"`
 	Checksum     string    `json:"checksum"`
+	HMAC         string    `json:"hmac,omitempty"`
 }
 
 // ComputeChecksum returns SHA256(prevChecksum + details + eventType + timestamp).
@@ -44,6 +44,31 @@ func (e *Event) VerifyChecksum() bool {
 	return e.Checksum == e.ComputeChecksum(e.PrevChecksum)
 }
 
+func (e *Event) ComputeHMAC(key []byte) string {
+	if len(key) == 0 {
+		return ""
+	}
+	h := hmac.New(sha256.New, key)
+	h.Write([]byte(e.ID))
+	h.Write([]byte(e.BucketID))
+	h.Write([]byte(e.Scheme))
+	h.Write([]byte(e.Namespace))
+	h.Write([]byte(fmt.Sprintf("%d", e.Seq)))
+	h.Write([]byte(e.EventType))
+	h.Write(e.Details)
+	h.Write([]byte(e.Timestamp.Format(time.RFC3339Nano)))
+	h.Write([]byte(e.PrevChecksum))
+	h.Write([]byte(e.Checksum))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func (e *Event) VerifyHMAC(key []byte) bool {
+	if len(key) == 0 || e.HMAC == "" {
+		return true
+	}
+	return hmac.Equal([]byte(e.HMAC), []byte(e.ComputeHMAC(key)))
+}
+
 const (
 	rootBucket    = "__audit__"
 	chainIndexKey = "__chain_index__"
@@ -58,12 +83,12 @@ type chainIndex struct {
 
 // Store handles audit event persistence against a store.Store backend.
 type Store struct {
-	db store.Store
+	db         store.Store
+	signingKey []byte
 }
 
-// New creates a new audit Store wrapping the given store.Store.
-func New(db store.Store) *Store {
-	return &Store{db: db}
+func New(db store.Store, signingKey []byte) *Store {
+	return &Store{db: db, signingKey: signingKey}
 }
 
 // Init creates the root audit bucket if it does not exist.
@@ -80,7 +105,7 @@ func (a *Store) Append(scheme, namespace string, event *Event) error {
 	return a.db.Update(func(tx store.Tx) error {
 		root := tx.Bucket([]byte(rootBucket))
 		if root == nil {
-			return fmt.Errorf("audit bucket not initialised — call Init() first")
+			return fmt.Errorf("audit bucket not initialised")
 		}
 		sb, err := root.CreateBucketIfNotExists([]byte(scheme))
 		if err != nil {
@@ -91,12 +116,15 @@ func (a *Store) Append(scheme, namespace string, event *Event) error {
 			return err
 		}
 
-		// Read current index to get next sequence number.
 		var idx chainIndex
 		if raw := nb.Get([]byte(chainIndexKey)); raw != nil {
 			_ = json.Unmarshal(raw, &idx)
 		}
 		event.Seq = idx.EventCount + 1
+
+		if len(a.signingKey) > 0 {
+			event.HMAC = event.ComputeHMAC(a.signingKey)
+		}
 
 		data, err := json.Marshal(event)
 		if err != nil {
@@ -106,16 +134,12 @@ func (a *Store) Append(scheme, namespace string, event *Event) error {
 			return err
 		}
 
-		// Update index.
 		idx.LastID = event.ID
 		idx.LastChecksum = event.Checksum
 		idx.EventCount = event.Seq
 		idxData, _ := json.Marshal(idx)
 		if err := nb.Put([]byte(chainIndexKey), idxData); err != nil {
 			return err
-		}
-		if idx.EventCount%snapshotEvery == 0 {
-			// Snapshot placeholder — compress/archive in production.
 		}
 		return nil
 	})
@@ -177,6 +201,9 @@ func (a *Store) VerifyIntegrity(scheme, namespace string) error {
 		if i > 0 && e.PrevChecksum != prev {
 			return fmt.Errorf("%w: event %d (seq %d) prev_checksum mismatch", ErrChainBroken, i, e.Seq)
 		}
+		if len(a.signingKey) > 0 && !e.VerifyHMAC(a.signingKey) {
+			return fmt.Errorf("%w: event %d (seq %d) HMAC verification failed", ErrChainBroken, i, e.Seq)
+		}
 		prev = e.Checksum
 	}
 	return nil
@@ -209,9 +236,6 @@ func (a *Store) LastChecksum(scheme, namespace string) string {
 	return cs
 }
 
-// Prune removes events older than olderThan, keeping at least keepLastN recent ones.
-// High-security buckets (caller responsibility to check policy before calling) are
-// never pruned — callers should gate on policy.Level before invoking.
 func (a *Store) Prune(scheme, namespace string, olderThan time.Duration, keepLastN int) error {
 	if keepLastN < 0 {
 		keepLastN = 0
@@ -266,5 +290,4 @@ func (a *Store) Prune(scheme, namespace string, olderThan time.Duration, keepLas
 	})
 }
 
-// ErrChainBroken is returned when audit chain integrity verification fails.
 var ErrChainBroken = fmt.Errorf("audit chain integrity check failed")
