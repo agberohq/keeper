@@ -1,6 +1,7 @@
 package keeper
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -179,6 +180,34 @@ func (s *Keeper) unlockBucketAdminWrapped(scheme, namespace, adminID string, adm
 	return nil
 }
 
+// unlockBucketHSM calls the HSMProvider to unwrap the DEK and places it in the Envelope.
+// Both LevelHSM and LevelRemote buckets follow the same unwrap path through this function.
+func (s *Keeper) unlockBucketHSM(scheme, namespace string) error {
+	policy, err := s.loadPolicy(scheme, namespace)
+	if err != nil {
+		return err
+	}
+	if policy.Level != LevelHSM && policy.Level != LevelRemote {
+		return fmt.Errorf("bucket %s:%s is not LevelHSM or LevelRemote", scheme, namespace)
+	}
+	if policy.HSMProvider == nil {
+		return ErrHSMProviderNil
+	}
+	wrapped, ok := policy.WrappedDEKs[hsmWrappedDEKKey]
+	if !ok {
+		return fmt.Errorf("bucket %s:%s has no wrapped DEK", scheme, namespace)
+	}
+	dekBytes, err := policy.HSMProvider.UnwrapDEK(wrapped)
+	if err != nil {
+		return fmt.Errorf("HSM unwrap failed for %s:%s: %w", scheme, namespace, err)
+	}
+	// dekBytes is in plaintext for the minimum time required to seal it.
+	s.envelope.HoldBytes(scheme, namespace, dekBytes)
+	s.logger.Fields("scheme", scheme, "namespace", namespace, "level", string(policy.Level)).Info("bucket unlocked via HSM provider")
+	_ = s.policyChain.AppendEvent(scheme, namespace, "unlocked_hsm", nil)
+	return nil
+}
+
 // lockBucket removes the DEK from the Envelope for a single bucket.
 func (s *Keeper) lockBucket(scheme, namespace string) {
 	s.envelope.Drop(scheme, namespace)
@@ -227,13 +256,11 @@ func (s *Keeper) updateActivity() {
 
 // Crash-safe key rotation.
 //
-// reencryptAllWithKey writes a WAL before touching any record. The WAL stores:
-//   - A cursor (LastKey) advanced after each record, so interrupted rotations
-//     can resume without re-processing completed records.
-//   - WrappedOldKey: the pre-rotation master key encrypted with the new master
-//     key. This is the only safe way to carry the old key across a crash
-//     boundary; without it, undone records cannot be decrypted at resume time
-//     because the old passphrase is gone.
+// reencryptAllWithKey writes a WAL before touching any record. The WAL stores
+// a cursor (LastKey) and WrappedOldKey so interrupted rotations can resume
+// after a crash without losing access to either the old or new ciphertext.
+// LevelHSM and LevelRemote buckets are intentionally skipped — their DEKs
+// are managed by the external provider and are unaffected by master key changes.
 func (s *Keeper) reencryptAllWithKey(newKey, oldKey []byte) error {
 	if len(oldKey) == 0 {
 		return errors.New("old key is empty")
@@ -294,9 +321,21 @@ func (s *Keeper) resumeRotation(masterKey []byte) error {
 	return s.clearRotationWAL()
 }
 
+// isHSMOrRemotePolicy returns true when the registered policy for the given
+// registry key is LevelHSM or LevelRemote and should be skipped during
+// master-key re-encryption. Unregistered keys default to false.
+func (s *Keeper) isHSMOrRemotePolicy(scheme, namespace string) bool {
+	key := scheme + ":" + namespace
+	if p, ok := s.schemeRegistry[key]; ok {
+		return p.Level == LevelHSM || p.Level == LevelRemote
+	}
+	return false
+}
+
 // encryptAllRecords iterates every secret bucket and re-encrypts each record
-// individually. Each record is committed in its own atomic bbolt.Update.
-// The WAL cursor is updated after each successful write.
+// individually, skipping LevelHSM and LevelRemote buckets whose DEKs are
+// controlled by an external provider. Each record is committed in its own
+// atomic bbolt.Update and the WAL cursor is advanced after each write.
 func (s *Keeper) encryptAllRecords(newKey, oldKey []byte, wal *RotationWAL) error {
 	var schemes []string
 	if err := s.db.View(func(tx pkgstore.Tx) error {
@@ -329,6 +368,11 @@ func (s *Keeper) encryptAllRecords(newKey, oldKey []byte, wal *RotationWAL) erro
 		}
 
 		for _, nsName := range namespaces {
+			if s.isHSMOrRemotePolicy(schemeName, nsName) {
+				s.logger.Fields("scheme", schemeName, "namespace", nsName).Info("skipping HSM/Remote bucket during key rotation")
+				continue
+			}
+
 			var keys []string
 			if err := s.db.View(func(tx pkgstore.Tx) error {
 				nb := s.getNamespaceBucket(tx, schemeName, nsName)
@@ -513,6 +557,17 @@ func (ss *SaltStore) currentSalt() []byte {
 		return ss.Entries[len(ss.Entries)-1].Salt
 	}
 	return nil
+}
+
+// currentSaltCreatedAt returns the CreatedAt time of the current salt entry.
+// Used by NeedsAdminRekey to compare against policy.LastRekeyed.
+func (ss *SaltStore) currentSaltCreatedAt() time.Time {
+	for _, e := range ss.Entries {
+		if e.Version == ss.CurrentVersion {
+			return e.CreatedAt
+		}
+	}
+	return time.Time{}
 }
 
 // saltVersion returns the current salt version number.
@@ -899,6 +954,51 @@ func (s *Keeper) audit(action, scheme, namespace, key string, success bool, dura
 	}
 	if s.hooks.OnAudit != nil {
 		s.hooks.OnAudit(action, scheme, namespace, key, success, duration)
+	}
+}
+
+// newDBHealthCheck returns a function suitable for use as a jack.Patient Check.
+// It times a single BoltDB read on the metadata verification key and returns
+// ErrCheckLatency when the latency exceeds the configured threshold.
+func (s *Keeper) newDBHealthCheck(threshold time.Duration) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		start := time.Now()
+		_ = s.db.View(func(tx pkgstore.Tx) error {
+			b := tx.Bucket([]byte(metaBucket))
+			if b != nil {
+				_ = b.Get([]byte(metaVerifyKey))
+			}
+			return nil
+		})
+		if elapsed := time.Since(start); elapsed > threshold {
+			return fmt.Errorf("%w: %s (threshold %s)", ErrCheckLatency, elapsed, threshold)
+		}
+		return nil
+	}
+}
+
+// newEncHealthCheck returns a function suitable for use as a jack.Patient Check.
+// It encrypts and decrypts a fixed synthetic test vector to confirm the active
+// cipher and key are operational. The test vector never contains real secret data.
+func (s *Keeper) newEncHealthCheck() func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		key, err := s.bucketKeyBytes(s.defaultScheme, s.defaultNs)
+		if err != nil {
+			return fmt.Errorf("enc health: cannot retrieve DEK: %w", err)
+		}
+		defer secureZero(key)
+		ct, err := s.encryptWithKey(encHealthTestVector, key)
+		if err != nil {
+			return fmt.Errorf("enc health: encryption failed: %w", err)
+		}
+		pt, err := s.decryptWithKey(ct, key)
+		if err != nil {
+			return fmt.Errorf("enc health: decryption failed: %w", err)
+		}
+		if string(pt) != string(encHealthTestVector) {
+			return fmt.Errorf("enc health: round-trip mismatch")
+		}
+		return nil
 	}
 }
 

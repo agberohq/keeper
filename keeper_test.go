@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -536,7 +537,7 @@ func TestCustomKDF(t *testing.T) {
 }
 
 func TestCustomCipher(t *testing.T) {
-	var enc, dec int
+	var enc, dec atomic.Int64
 	store, err := New(Config{
 		DBPath: filepath.Join(t.TempDir(), "s.db"),
 		NewCipher: func(key []byte) (crypt.Cipher, error) {
@@ -550,10 +551,13 @@ func TestCustomCipher(t *testing.T) {
 	store.Unlock([]byte("pass"))
 	store.Set("k", []byte("v"))
 	store.Get("k")
-	if enc == 0 {
+	// Allow the incrementAccessCount goroutine spawned by Get to complete
+	// before reading the counters.
+	time.Sleep(50 * time.Millisecond)
+	if enc.Load() == 0 {
 		t.Error("custom cipher Encrypt not called")
 	}
-	if dec == 0 {
+	if dec.Load() == 0 {
 		t.Error("custom cipher Decrypt not called")
 	}
 }
@@ -751,13 +755,16 @@ type mockKDF struct {
 
 func (m *mockKDF) DeriveKey(p, s []byte, n int) ([]byte, error) { return m.fn(p, s, n) }
 
+// countingCipher is a test-only crypt.Cipher that counts Encrypt and Decrypt
+// calls using atomic counters to avoid data races with the incrementAccessCount
+// goroutine that Get spawns concurrently.
 type countingCipher struct {
 	key      []byte
-	enc, dec *int
+	enc, dec *atomic.Int64
 }
 
 func (c *countingCipher) Encrypt(pt []byte) ([]byte, error) {
-	*c.enc++
+	c.enc.Add(1)
 	out := make([]byte, len(pt)+1)
 	out[0] = 0xAB
 	for i, b := range pt {
@@ -765,8 +772,9 @@ func (c *countingCipher) Encrypt(pt []byte) ([]byte, error) {
 	}
 	return out, nil
 }
+
 func (c *countingCipher) Decrypt(ct []byte) ([]byte, error) {
-	*c.dec++
+	c.dec.Add(1)
 	if len(ct) < 1 {
 		return nil, fmt.Errorf("too short")
 	}
@@ -776,8 +784,6 @@ func (c *countingCipher) Decrypt(ct []byte) ([]byte, error) {
 	}
 	return out, nil
 }
-
-// ── Benchmarks ───────────────────────────────────────────────────────────
 
 func BenchmarkSet(b *testing.B) {
 	store, _ := New(Config{DBPath: filepath.Join(b.TempDir(), "s.db")})

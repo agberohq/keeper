@@ -33,6 +33,13 @@ import (
 //	WrapDEK(dek, HKDF(master‖adminPass, salt)).
 //	UnlockBucket(adminID, adminPassword) → Envelope.
 //	Reaper TTL drops these DEKs after inactivity when Jack is configured.
+//
+// LevelHSM and LevelRemote buckets:
+//
+//	Random DEK generated at CreateBucket time, wrapped by the HSMProvider.
+//	UnlockDatabase automatically calls the provider to unwrap and seed the
+//	Envelope for all registered HSM/Remote buckets. Master key rotation does
+//	not re-encrypt these buckets — the DEK is provider-controlled.
 type Keeper struct {
 	db             pkgstore.Store
 	master         *Master
@@ -53,8 +60,14 @@ type Keeper struct {
 	policyKey      []byte // HMAC key for policy authentication; nil when locked
 
 	// Jack-managed background components; nil when running without Jack.
-	autoLocker *jack.Looper
-	jackReaper *jack.Reaper
+	autoLocker     *jack.Looper
+	jackReaper     *jack.Reaper
+	pruneScheduler *jack.Scheduler
+
+	// doctor is the jack.Doctor instance monitoring DB and encryption health.
+	// doctorOwned is true when Keeper created it (not provided via JackConfig).
+	doctor      JackDoctor
+	doctorOwned bool
 }
 
 // WithJack returns an option that attaches Jack integration handles to the Config.
@@ -146,7 +159,7 @@ func New(config Config, opts ...func(*Config)) (*Keeper, error) {
 
 	// Register with Jack Shutdown when provided.
 	// Keeper's only registered callback is Lock — the pool lifecycle
-	// belongs to Agbero and is never touched here.
+	// belongs to the caller and is never touched here.
 	if config.Jack.Shutdown != nil {
 		_ = config.Jack.Shutdown.Register(func() error {
 			return store.Lock()
@@ -172,6 +185,9 @@ func Open(config Config, opts ...func(*Config)) (*Keeper, error) {
 //
 // For LevelAdminWrapped: the bucket is inaccessible until at least one admin
 // is added via AddAdminToPolicy and then unlocked via UnlockBucket.
+//
+// For LevelHSM and LevelRemote: the policy must carry a non-nil HSMProvider.
+// The DEK is generated here, wrapped by the provider, and stored in WrappedDEKs.
 func (s *Keeper) CreateBucket(scheme, namespace string, level SecurityLevel, createdBy string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -195,13 +211,46 @@ func (s *Keeper) CreateBucket(scheme, namespace string, level SecurityLevel, cre
 		CreatedBy:         createdBy,
 		EncryptionVersion: 1,
 	}
-	if level == LevelAdminWrapped {
+
+	switch level {
+	case LevelAdminWrapped:
 		salt, err := GenerateDEKSalt()
 		if err != nil {
 			return fmt.Errorf("failed to generate DEK salt: %w", err)
 		}
 		policy.DEKSalt = salt
 		policy.WrappedDEKs = make(map[string][]byte)
+
+	case LevelHSM, LevelRemote:
+		// Caller must have set the HSMProvider on the policy before calling CreateBucket.
+		// We retrieve it from the registry if the caller registered it there first.
+		if policy.HSMProvider == nil {
+			if reg, ok := s.schemeRegistry[scheme+":"+namespace]; ok {
+				policy.HSMProvider = reg.HSMProvider
+			}
+		}
+		if policy.HSMProvider == nil {
+			return ErrHSMProviderNil
+		}
+		dekEnc, err := GenerateDEK()
+		if err != nil {
+			return fmt.Errorf("failed to generate DEK: %w", err)
+		}
+		dekBuf, err := dekEnc.Open()
+		if err != nil {
+			return fmt.Errorf("failed to open DEK enclave: %w", err)
+		}
+		dekBytes := make([]byte, dekBuf.Size())
+		copy(dekBytes, dekBuf.Bytes())
+		dekBuf.Destroy()
+
+		wrapped, err := policy.HSMProvider.WrapDEK(dekBytes)
+		secureZero(dekBytes)
+		if err != nil {
+			return fmt.Errorf("HSM wrap failed: %w", err)
+		}
+		policy.WrappedDEKs = map[string][]byte{hsmWrappedDEKKey: wrapped}
+		policy.LastRekeyed = time.Now()
 	}
 
 	if err := policy.Validate(); err != nil {
@@ -224,7 +273,37 @@ func (s *Keeper) CreateBucket(scheme, namespace string, level SecurityLevel, cre
 			s.audit("seed_new_bucket_failed", scheme, namespace, "", false, 0)
 		}
 	}
+
+	// Seed the Envelope for HSM/Remote buckets immediately when already unlocked.
+	if !s.locked && (level == LevelHSM || level == LevelRemote) {
+		if err := s.unlockBucketHSM(scheme, namespace); err != nil {
+			s.audit("seed_new_hsm_bucket_failed", scheme, namespace, "", false, 0)
+		}
+	}
+
 	s.logger.Fields("scheme", scheme, "namespace", namespace, "level", string(level), "createdBy", createdBy).Info("bucket created")
+	return nil
+}
+
+// RegisterHSMProvider attaches an HSMProvider to an existing LevelHSM or LevelRemote
+// policy in the registry. This must be called after Open and before UnlockDatabase
+// so the provider is available when the bucket is automatically unlocked.
+// It returns an error if the policy is not found or is not HSM/Remote level.
+func (s *Keeper) RegisterHSMProvider(scheme, namespace string, provider HSMProvider) error {
+	if provider == nil {
+		return ErrHSMProviderNil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := scheme + ":" + namespace
+	policy, ok := s.schemeRegistry[key]
+	if !ok {
+		return ErrPolicyNotFound
+	}
+	if policy.Level != LevelHSM && policy.Level != LevelRemote {
+		return fmt.Errorf("bucket %s:%s is not LevelHSM or LevelRemote", scheme, namespace)
+	}
+	policy.HSMProvider = provider
 	return nil
 }
 
@@ -386,8 +465,10 @@ func (s *Keeper) DeriveMaster(passphrase []byte) (*Master, error) {
 //
 // All LevelPasswordOnly buckets are unlocked immediately via the Envelope.
 // LevelAdminWrapped buckets require a separate UnlockBucket call.
-// The audit HMAC signing key is derived from the master and activated.
-// Background metadata migration starts after unlock completes.
+// LevelHSM and LevelRemote buckets are unlocked automatically via their
+// registered HSMProvider. The audit HMAC signing key is derived from the
+// master and activated. Background tasks (auto-lock, prune scheduler, health
+// patients) are started after unlock completes.
 func (s *Keeper) UnlockDatabase(master *Master) error {
 	if master == nil || !master.IsValid() {
 		return ErrMasterRequired
@@ -474,9 +555,17 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 		return fmt.Errorf("failed to unlock default bucket: %w", err)
 	}
 	for _, policy := range s.schemeRegistry {
-		if policy.Level == LevelPasswordOnly {
+		switch policy.Level {
+		case LevelPasswordOnly:
 			if err := s.unlockBucketPasswordOnly(policy.Scheme, policy.Namespace); err != nil {
 				s.audit("unlock_bucket_failed", policy.Scheme, policy.Namespace, "", false, 0)
+			}
+		case LevelHSM, LevelRemote:
+			if policy.HSMProvider != nil {
+				if err := s.unlockBucketHSM(policy.Scheme, policy.Namespace); err != nil {
+					s.logger.Fields("scheme", policy.Scheme, "namespace", policy.Namespace, "err", err).Warn("HSM bucket unlock failed — bucket remains locked")
+					s.audit("unlock_hsm_bucket_failed", policy.Scheme, policy.Namespace, "", false, 0)
+				}
 			}
 		}
 	}
@@ -525,9 +614,88 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 		)
 	}
 
+	// Start the audit prune scheduler if configured.
+	s.startPruneScheduler()
+
+	// Start jack.Doctor health patients for DB latency and encryption.
+	s.startHealthPatients()
+
 	s.logger.Fields("defaultScheme", s.defaultScheme, "defaultNs", s.defaultNs).Info("store unlocked")
 	s.audit("unlock_database", "", "", "", true, 0)
 	return nil
+}
+
+// startPruneScheduler creates and starts a jack.Scheduler that periodically
+// calls PruneEvents on all registered non-HSM buckets. It is a no-op when
+// AuditPruneInterval is zero or the scheduler was not imported.
+func (s *Keeper) startPruneScheduler() {
+	interval := s.config.AuditPruneInterval
+	if interval <= 0 {
+		return
+	}
+	keepLastN := s.config.AuditPruneKeepLastN
+	if keepLastN == 0 {
+		keepLastN = defaultAuditPruneKeepLastN
+	}
+	olderThan := s.config.AuditPruneOlderThan
+	if olderThan == 0 {
+		olderThan = time.Duration(defaultAuditPruneOlderThan) * time.Second
+	}
+
+	pool := jack.NewPool(1)
+	sched, err := jack.NewScheduler("keeper:audit:prune", pool, jack.Routine{Interval: interval})
+	if err != nil {
+		s.logger.Fields("err", err).Warn("audit prune scheduler: failed to create")
+		return
+	}
+
+	keepN := keepLastN
+	older := olderThan
+	task := jack.FuncCtx(func(ctx context.Context) error {
+		s.mu.RLock()
+		if s.locked {
+			s.mu.RUnlock()
+			return nil
+		}
+		s.mu.RUnlock()
+		for _, policy := range s.schemeRegistry {
+			if err := s.policyChain.PruneEvents(policy.Scheme, policy.Namespace, older, keepN); err != nil {
+				s.logger.Fields("scheme", policy.Scheme, "namespace", policy.Namespace, "err", err).Warn("audit prune failed")
+			}
+		}
+		return nil
+	})
+	if err := sched.DoCtx(context.Background(), task); err != nil {
+		s.logger.Fields("err", err).Warn("audit prune scheduler: failed to start")
+		return
+	}
+	s.pruneScheduler = sched
+	s.logger.Fields("interval", interval, "keepLastN", keepN, "olderThan", older).Info("audit prune scheduler started")
+}
+
+// startHealthPatients registers DB latency and encryption health patients with
+// the jack.Doctor. When no external Doctor is provided via JackConfig.Doctor,
+// a new one is created and owned by the Keeper.
+func (s *Keeper) startHealthPatients() {
+	if s.config.Jack.Doctor != nil {
+		s.doctor = s.config.Jack.Doctor
+		s.doctorOwned = false
+	} else {
+		s.doctor = jack.NewDoctor()
+		s.doctorOwned = true
+	}
+
+	threshold := s.config.DBLatencyThreshold
+	if threshold <= 0 {
+		threshold = defaultDBLatencyThreshold
+	}
+
+	dbCheck := s.newDBHealthCheck(threshold)
+	encCheck := s.newEncHealthCheck()
+
+	_ = s.doctor.Add(newHealthPatient(healthPatientIDDB, dbCheck))
+	_ = s.doctor.Add(newHealthPatient(healthPatientIDEnc, encCheck))
+	s.logger.Info("health patients registered")
 }
 
 // Lock locks the store: drops all DEKs, wipes the master key, clears the audit
@@ -545,6 +713,18 @@ func (s *Keeper) Lock() error {
 	if s.jackReaper != nil {
 		s.jackReaper.Stop()
 		s.jackReaper = nil
+	}
+	if s.pruneScheduler != nil {
+		_ = s.pruneScheduler.Stop()
+		s.pruneScheduler = nil
+	}
+	if s.doctor != nil {
+		s.doctor.Remove(healthPatientIDDB)
+		s.doctor.Remove(healthPatientIDEnc)
+		if s.doctorOwned {
+			s.doctor.StopAll(5 * time.Second)
+		}
+		s.doctor = nil
 	}
 	s.envelope.DropAll()
 	s.auditStore.setSigningKey(nil)

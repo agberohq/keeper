@@ -1,5 +1,3 @@
-// global.go - Updated with constants
-
 package keeper
 
 import (

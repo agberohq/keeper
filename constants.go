@@ -1,5 +1,7 @@
 package keeper
 
+import "time"
+
 // DB bucket names.
 const (
 	defaultScheme    = "default"
@@ -75,7 +77,35 @@ const (
 	LevelPasswordOnly SecurityLevel = "password_only"
 	LevelAdminWrapped SecurityLevel = "admin_wrapped"
 	LevelHSM          SecurityLevel = "hsm"
+	LevelRemote       SecurityLevel = "remote"
 )
+
+// hsmWrappedDEKKey is the map key used to store the HSM/Remote wrapped DEK
+// inside BucketSecurityPolicy.WrappedDEKs.
+const hsmWrappedDEKKey = "hsm"
 
 // keyDerivationLabel is the human-readable algorithm identifier stored in StoreStats.
 const keyDerivationLabel = "argon2id+xchacha20poly1305"
+
+// Audit prune defaults. Stored as seconds so they can be declared as untyped
+// integer constants and converted to time.Duration at the call site.
+const (
+	defaultAuditPruneInterval  = 24 * 60 * 60 // seconds — 24 h
+	defaultAuditPruneKeepLastN = 10_000
+	defaultAuditPruneOlderThan = 90 * 24 * 60 * 60 // seconds — 90 days
+)
+
+// defaultDBLatencyThreshold is the maximum acceptable single-key read latency
+// before the DB health patient reports degradation (200 ms in nanoseconds).
+const defaultDBLatencyThreshold = 200 * time.Millisecond
+
+// healthPatientIDDB and healthPatientIDEnc are the patient IDs registered
+// with jack.Doctor for the two keeper health checks.
+const (
+	healthPatientIDDB  = "keeper:health:db"
+	healthPatientIDEnc = "keeper:health:enc"
+)
+
+// encHealthTestVector is the fixed 32-byte plaintext used by the encryption
+// health check. It must never be derived from real secret material.
+var encHealthTestVector = []byte("keeper-enc-health-check-v1-00000")

@@ -12,10 +12,12 @@ import (
 // New deployments should use DefaultArgon2KDF instead.
 //
 // Recommended migration path:
-//  1. Open the existing database with a ScryptKDF in Config.KDF.
-//  2. Call Rotate with the same passphrase — this re-derives with Argon2id and
-//     re-encrypts all secrets in one atomic operation.
-//  3. Replace ScryptKDF with DefaultArgon2KDF in your Config going forward.
+// Open the existing database with a ScryptKDF in Config.KDF.
+// Call Rotate with the same passphrase — this re-derives with Argon2id and
+//
+//	re-encrypts all secrets in one atomic operation.
+//
+// Replace ScryptKDF with DefaultArgon2KDF in your Config going forward.
 type ScryptKDF struct {
 	// N is the CPU/memory cost parameter. Must be a power of 2 (≥2).
 	N int

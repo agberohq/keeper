@@ -6,6 +6,7 @@ import (
 
 	"github.com/agberohq/keeper/pkg/crypt"
 	"github.com/olekukonko/errors"
+	jack "github.com/olekukonko/jack"
 	"github.com/olekukonko/ll"
 )
 
@@ -32,6 +33,8 @@ var (
 	ErrAdminNotFound      = errors.New("admin ID not found in bucket policy")
 	ErrPolicySignature    = errors.New("policy signature verification failed")
 	ErrMetadataDecrypt    = errors.New("metadata decryption failed")
+	ErrHSMProviderNil     = errors.New("LevelHSM and LevelRemote require a non-nil HSMProvider")
+	ErrCheckLatency       = errors.New("database read latency exceeded threshold")
 
 	// ErrAuthFailed is returned for any authentication failure in UnlockBucket.
 	// It deliberately does not distinguish between an unknown admin ID and a
@@ -47,6 +50,15 @@ type SchemeHandler interface {
 	PreSet(scheme, namespace, key string, value []byte) ([]byte, error)
 	PostGet(scheme, namespace, key string, value []byte) ([]byte, error)
 	OnDelete(scheme, namespace, key string) error
+}
+
+// HSMProvider abstracts wrap/unwrap operations for LevelHSM and LevelRemote buckets.
+// Implementations must be safe for concurrent use from multiple goroutines.
+// Ping is used by the jack.Doctor health patient to verify provider liveness.
+type HSMProvider interface {
+	WrapDEK(dek []byte) ([]byte, error)
+	UnwrapDEK(wrapped []byte) ([]byte, error)
+	Ping(ctx context.Context) error
 }
 
 // Hooks injects custom logic at key lifecycle points.
@@ -71,11 +83,21 @@ type JackShutdown interface {
 	Done() <-chan struct{}
 }
 
+// JackDoctor is the subset of jack.Doctor that keeper uses for health monitoring.
+// Add accepts *jack.Patient to match the concrete jack.Doctor.Add signature so
+// that *jack.Doctor satisfies this interface without an adapter.
+type JackDoctor interface {
+	Add(p *jack.Patient) error
+	Remove(id string) bool
+	StopAll(timeout time.Duration)
+}
+
 // JackConfig carries optional Jack integration handles.
-// Both fields are optional; nil means keeper manages its own equivalent.
+// All fields are optional; nil means keeper manages its own equivalent.
 type JackConfig struct {
 	Pool     JackPool
 	Shutdown JackShutdown
+	Doctor   JackDoctor
 }
 
 // Config holds all configuration for a Keeper instance.
@@ -88,6 +110,20 @@ type Config struct {
 	DefaultNamespace string
 	Logger           *ll.Logger
 	Jack             JackConfig
+
+	// AuditPruneInterval controls how often the scheduler prunes audit events.
+	// Set to 0 to disable automatic pruning.
+	AuditPruneInterval time.Duration
+
+	// AuditPruneOlderThan removes events older than this duration each prune cycle.
+	AuditPruneOlderThan time.Duration
+
+	// AuditPruneKeepLastN retains at least this many recent events regardless of age.
+	AuditPruneKeepLastN int
+
+	// DBLatencyThreshold is the maximum acceptable database read latency.
+	// Defaults to defaultDBLatencyThreshold when zero.
+	DBLatencyThreshold time.Duration
 
 	KDF       crypt.KDF
 	NewCipher func(key []byte) (crypt.Cipher, error)

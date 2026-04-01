@@ -29,6 +29,9 @@ func (s *Keeper) Unlock(passphrase []byte) error {
 //
 // passphrase must be the current passphrase — it is used to re-derive the
 // master key under the new salt. It is NOT zeroed by this method.
+// LevelAdminWrapped buckets are NOT re-keyed by this call because their DEKs
+// use a per-bucket salt, not the master KDF salt. Call RotateAdminWrappedDEK
+// separately after this method completes.
 func (s *Keeper) RotateSalt(passphrase []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -94,14 +97,138 @@ func (s *Keeper) RotateSalt(passphrase []byte) error {
 	}
 
 	for _, policy := range s.schemeRegistry {
-		if policy.Level == LevelPasswordOnly {
+		switch policy.Level {
+		case LevelPasswordOnly:
 			if err := s.unlockBucketPasswordOnly(policy.Scheme, policy.Namespace); err != nil {
 				s.audit("salt_rotate_reseed_failed", policy.Scheme, policy.Namespace, "", false, 0)
 			}
+		case LevelAdminWrapped:
+			s.logger.Fields(
+				"scheme", policy.Scheme,
+				"namespace", policy.Namespace,
+				"policy_id", policy.ID,
+			).Warn("LevelAdminWrapped bucket not re-keyed by RotateSalt — call RotateAdminWrappedDEK to update the per-bucket DEK salt")
 		}
 	}
 	_ = s.unlockBucketPasswordOnly(s.defaultScheme, s.defaultNs)
 	s.logger.Info("salt rotation completed")
+	return nil
+}
+
+// NeedsAdminRekey reports whether a LevelAdminWrapped bucket's wrapped DEKs
+// were last re-keyed before the current master salt was generated.
+// Returns false with no error for LevelPasswordOnly, LevelHSM, and LevelRemote buckets.
+func (s *Keeper) NeedsAdminRekey(scheme, namespace string) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.locked {
+		return false, ErrStoreLocked
+	}
+	policy, err := s.loadPolicy(scheme, namespace)
+	if err != nil {
+		return false, err
+	}
+	if policy.Level != LevelAdminWrapped {
+		return false, nil
+	}
+	store, err := s.loadSaltStore()
+	if err != nil || store == nil {
+		return false, err
+	}
+	saltCreatedAt := store.currentSaltCreatedAt()
+	if saltCreatedAt.IsZero() {
+		return false, nil
+	}
+	// LastRekeyed zero means the bucket predates this feature and needs re-keying.
+	return policy.LastRekeyed.IsZero() || policy.LastRekeyed.Before(saltCreatedAt), nil
+}
+
+// RotateAdminWrappedDEK re-wraps the bucket DEK under a fresh per-bucket salt
+// for the given admin, then updates LastRekeyed on the policy.
+// The admin must authenticate with their current password to prove they hold
+// a valid copy of the DEK before it is re-wrapped. After this call, only
+// admins whose credentials were supplied here will have up-to-date wrapped copies.
+// Other admins must call this method with their own credentials to update their copy.
+func (s *Keeper) RotateAdminWrappedDEK(scheme, namespace, adminID string, adminPassword []byte) error {
+	defer secureZero(adminPassword)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.locked {
+		return ErrStoreLocked
+	}
+	policy, err := s.loadPolicy(scheme, namespace)
+	if err != nil {
+		return err
+	}
+	if policy.Level != LevelAdminWrapped {
+		return fmt.Errorf("bucket %s:%s is not LevelAdminWrapped", scheme, namespace)
+	}
+
+	// Authenticate the admin by unwrapping the existing DEK with their current password.
+	wrapped, ok := policy.WrappedDEKs[adminID]
+	if !ok {
+		return fmt.Errorf("%w: admin %q", ErrAdminNotFound, adminID)
+	}
+	masterBytes, err := s.master.Bytes()
+	if err != nil {
+		return fmt.Errorf("failed to read master key: %w", err)
+	}
+	defer secureZero(masterBytes)
+
+	existingKEK, err := DeriveKEK(masterBytes, adminPassword, policy.DEKSalt)
+	if err != nil {
+		return ErrAuthFailed
+	}
+	dekEnc, err := UnwrapDEK(wrapped, existingKEK) // existingKEK zeroed inside UnwrapDEK
+	if err != nil {
+		return ErrAuthFailed
+	}
+	dekBuf, err := dekEnc.Open()
+	if err != nil {
+		return fmt.Errorf("failed to open DEK enclave: %w", err)
+	}
+	dekBytes := make([]byte, dekBuf.Size())
+	copy(dekBytes, dekBuf.Bytes())
+	dekBuf.Destroy()
+	defer secureZero(dekBytes)
+
+	// Generate a fresh per-bucket DEK salt.
+	newSalt, err := GenerateDEKSalt()
+	if err != nil {
+		return fmt.Errorf("failed to generate new DEK salt: %w", err)
+	}
+
+	// Re-wrap the DEK for this admin under the new salt.
+	newKEK, err := DeriveKEK(masterBytes, adminPassword, newSalt)
+	if err != nil {
+		return fmt.Errorf("failed to derive new KEK: %w", err)
+	}
+	newDEKEnc, err := NewMaster(dekBytes) // reuse memguard sealing pattern
+	if err != nil {
+		secureZero(newKEK)
+		return fmt.Errorf("failed to seal DEK for re-wrap: %w", err)
+	}
+	dekEncForWrap, oerr := newDEKEnc.Open()
+	if oerr != nil {
+		secureZero(newKEK)
+		return fmt.Errorf("failed to open sealed DEK: %w", oerr)
+	}
+	reWrapped, wErr := WrapDEK(dekEncForWrap.Seal(), newKEK) // newKEK zeroed inside WrapDEK
+	if wErr != nil {
+		return fmt.Errorf("failed to re-wrap DEK: %w", wErr)
+	}
+
+	policy.DEKSalt = newSalt
+	policy.WrappedDEKs[adminID] = reWrapped
+	policy.LastRekeyed = time.Now()
+
+	if err := s.savePolicy(policy); err != nil {
+		return fmt.Errorf("failed to save updated policy: %w", err)
+	}
+	s.schemeRegistry[fmt.Sprintf("%s:%s", scheme, namespace)] = policy
+	_ = s.policyChain.AppendEvent(scheme, namespace, "dek_rekeyed",
+		map[string]string{"admin": adminID})
+	s.logger.Fields("scheme", scheme, "namespace", namespace, "admin", adminID).Info("DEK re-keyed successfully")
 	return nil
 }
 

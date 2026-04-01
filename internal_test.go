@@ -3,6 +3,7 @@ package keeper
 import (
 	"bytes"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -101,17 +102,17 @@ func TestEncryptDecrypt_WrongBucket(t *testing.T) {
 }
 
 func TestEncryptDecrypt_CustomCipherFactory(t *testing.T) {
-	var encCount int
+	var encCount atomic.Int64
 	store, _ := New(Config{
 		DBPath: filepath.Join(t.TempDir(), "s.db"),
 		NewCipher: func(key []byte) (crypt.Cipher, error) {
-			return &countingCipher{key: key, enc: &encCount, dec: new(int)}, nil
+			return &countingCipher{key: key, enc: &encCount, dec: &atomic.Int64{}}, nil
 		},
 	})
 	defer store.Close()
 	store.Unlock([]byte("pass"))
 	store.Set("k", []byte("v"))
-	if encCount == 0 {
+	if encCount.Load() == 0 {
 		t.Error("custom cipher Encrypt was not called")
 	}
 }
