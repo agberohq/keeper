@@ -50,12 +50,11 @@ type Keeper struct {
 	envelope       *Envelope
 	auditStore     *auditStore
 	policyChain    *Chain
+	policyKey      []byte // HMAC key for policy authentication; nil when locked
 
 	// Jack-managed background components; nil when running without Jack.
-	autoLocker    *jack.Looper
-	jackReaper    *jack.Reaper
-	migrationLoop *jack.Looper
-	migrationDone chan struct{}
+	autoLocker *jack.Looper
+	jackReaper *jack.Reaper
 }
 
 // WithJack returns an option that attaches Jack integration handles to the Config.
@@ -127,7 +126,6 @@ func New(config Config, opts ...func(*Config)) (*Keeper, error) {
 		metrics:        &core.Metrics{},
 		schemeRegistry: make(map[string]*BucketSecurityPolicy),
 		envelope:       NewEnvelope(),
-		migrationDone:  make(chan struct{}, 1),
 	}
 
 	store.auditStore = newAuditStore(db)
@@ -424,6 +422,29 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 	s.auditStore.setSigningKey(auditKey)
 	secureZero(auditKey)
 
+	// Derive and activate the policy HMAC key.
+	masterBytes2, err := master.Bytes()
+	if err != nil {
+		s.locked = true
+		s.master = nil
+		s.auditStore.setSigningKey(nil)
+		return fmt.Errorf("failed to read master key for policy key derivation: %w", err)
+	}
+	policyKey, err := derivePolicyKey(masterBytes2)
+	secureZero(masterBytes2)
+	if err != nil {
+		s.locked = true
+		s.master = nil
+		s.auditStore.setSigningKey(nil)
+		return fmt.Errorf("failed to derive policy HMAC key: %w", err)
+	}
+	s.policyKey = policyKey
+
+	// Upgrade any policy records that only have a SHA-256 hash to HMAC tags.
+	if err := s.upgradePolicyHMACs(); err != nil {
+		s.logger.Fields("err", err).Warn("policy HMAC upgrade failed — continuing")
+	}
+
 	// Seed all LevelPasswordOnly buckets.
 	if err := s.unlockBucketPasswordOnly(s.defaultScheme, s.defaultNs); err != nil {
 		s.locked = true
@@ -483,9 +504,6 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 		)
 	}
 
-	// Start background metadata migration.
-	s.migrationLoop = s.runMigrations()
-
 	s.logger.Fields("defaultScheme", s.defaultScheme, "defaultNs", s.defaultNs).Info("store unlocked")
 	s.audit("unlock_database", "", "", "", true, 0)
 	return nil
@@ -503,16 +521,14 @@ func (s *Keeper) Lock() error {
 		s.autoLocker.Stop()
 		s.autoLocker = nil
 	}
-	if s.migrationLoop != nil {
-		s.migrationLoop.Stop()
-		s.migrationLoop = nil
-	}
 	if s.jackReaper != nil {
 		s.jackReaper.Stop()
 		s.jackReaper = nil
 	}
 	s.envelope.DropAll()
 	s.auditStore.setSigningKey(nil)
+	secureZero(s.policyKey)
+	s.policyKey = nil
 	if s.master != nil {
 		s.master.Destroy()
 		s.master = nil
@@ -738,16 +754,12 @@ func (s *Keeper) SetNamespacedFull(scheme, namespace, key string, value []byte) 
 	var createdAt time.Time
 	var accessCount, prevVersion int
 
-	if existing.SchemaVersion >= secretSchemaV1 && len(existing.EncryptedMeta) > 0 {
+	if len(existing.EncryptedMeta) > 0 {
 		if prev, merr := s.decryptMeta(existing.EncryptedMeta, bucketDEK); merr == nil {
 			createdAt = prev.CreatedAt
 			accessCount = prev.AccessCount
 			prevVersion = prev.Version
 		}
-	} else if !existing.CreatedAt.IsZero() {
-		createdAt = existing.CreatedAt
-		accessCount = existing.AccessCount
-		prevVersion = existing.Version
 	}
 	if createdAt.IsZero() {
 		createdAt = now
@@ -769,7 +781,7 @@ func (s *Keeper) SetNamespacedFull(scheme, namespace, key string, value []byte) 
 	secret := Secret{
 		Ciphertext:    ciphertext,
 		EncryptedMeta: em,
-		SchemaVersion: secretSchemaV2,
+		SchemaVersion: currentSchemaVersion,
 	}
 
 	if err := s.db.Update(func(tx pkgstore.Tx) error {
@@ -915,7 +927,7 @@ func (s *Keeper) CompareAndSwapNamespacedFull(scheme, namespace, key string, old
 		}
 		secret.Ciphertext = ct
 
-		if secret.SchemaVersion >= secretSchemaV1 && len(secret.EncryptedMeta) > 0 {
+		if len(secret.EncryptedMeta) > 0 {
 			metaKey, merr := s.deriveMetaKey(casKey)
 			if merr == nil {
 				if meta, merr := s.decryptMetaWithKey(secret.EncryptedMeta, metaKey); merr == nil {
@@ -927,8 +939,6 @@ func (s *Keeper) CompareAndSwapNamespacedFull(scheme, namespace, key string, old
 				}
 				secureZero(metaKey)
 			}
-		} else {
-			secret.Version++
 		}
 
 		nd, err := marshalSecret(&secret)
@@ -1238,15 +1248,8 @@ func (s *Keeper) Stats() (*StoreStats, error) {
 					}
 
 					var meta *EncryptedMetadata
-					if secret.SchemaVersion >= secretSchemaV1 && len(secret.EncryptedMeta) > 0 && bucketDEK != nil {
+					if len(secret.EncryptedMeta) > 0 && bucketDEK != nil {
 						meta, _ = s.decryptMeta(secret.EncryptedMeta, bucketDEK)
-					} else if secret.SchemaVersion == secretSchemaV0 && !secret.CreatedAt.IsZero() {
-						meta = &EncryptedMetadata{
-							CreatedAt:   secret.CreatedAt,
-							UpdatedAt:   secret.UpdatedAt,
-							AccessCount: secret.AccessCount,
-							Version:     secret.Version,
-						}
 					}
 
 					if meta != nil {

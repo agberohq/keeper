@@ -32,11 +32,10 @@ var (
 	ErrAdminNotFound      = errors.New("admin ID not found in bucket policy")
 	ErrPolicySignature    = errors.New("policy signature verification failed")
 	ErrMetadataDecrypt    = errors.New("metadata decryption failed")
-	ErrMigrationActive    = errors.New("background migration in progress")
-	// ErrAuthFailed is the single error returned for any authentication failure
-	// in public-facing methods (UnlockBucket, UnlockDatabase). It deliberately
-	// does not distinguish between "wrong password" and "unknown admin ID" to
-	// prevent admin ID enumeration attacks (CVSS 5.3 / CWE-204).
+
+	// ErrAuthFailed is returned for any authentication failure in UnlockBucket.
+	// It deliberately does not distinguish between an unknown admin ID and a
+	// wrong password to prevent admin ID enumeration (CWE-204 / CVSS 5.3).
 	ErrAuthFailed = errors.New("authentication failed")
 )
 
@@ -59,8 +58,7 @@ type Hooks struct {
 }
 
 // JackPool is the subset of jack.Pool that keeper uses.
-// Agbero passes a *jack.Pool which satisfies this interface.
-// Keeper never calls Shutdown — the pool lifecycle is owned by Agbero.
+// Keeper never calls Shutdown — the pool lifecycle is owned by the caller.
 type JackPool interface {
 	Do(fn func())
 	DoCtx(ctx context.Context, fn func(context.Context))
@@ -74,7 +72,6 @@ type JackShutdown interface {
 }
 
 // JackConfig carries optional Jack integration handles.
-// Pass via WithJack when constructing a Keeper from an Agbero process.
 // Both fields are optional; nil means keeper manages its own equivalent.
 type JackConfig struct {
 	Pool     JackPool
@@ -104,52 +101,32 @@ type Config struct {
 }
 
 // Secret is the on-disk record for a single key.
-//
-// SchemaVersion distinguishes legacy records (V0, plaintext metadata fields)
-// from current records (V1, metadata encrypted in EncryptedMeta).
-// The dual-format read path in Get is removed once all records are migrated.
+// All records are encoded with msgpack. SchemaVersion is always 1.
 type Secret struct {
-	Ciphertext    []byte `json:"ct"`
-	EncryptedMeta []byte `json:"em,omitempty"`
-	SchemaVersion int    `json:"sv"`
-
-	// V0 plaintext fields — present only in legacy records (SchemaVersion == 0).
-	// Do not write these on new records; use EncryptedMeta instead.
-	CreatedAt   time.Time `json:"created_at,omitempty"`
-	UpdatedAt   time.Time `json:"updated_at,omitempty"`
-	AccessCount int       `json:"access_count,omitempty"`
-	LastAccess  time.Time `json:"last_access,omitempty"`
-	Version     int       `json:"version,omitempty"`
+	Ciphertext    []byte `msgpack:"ct"`
+	EncryptedMeta []byte `msgpack:"em,omitempty"`
+	SchemaVersion int    `msgpack:"sv"`
 }
 
-// EncryptedMetadata holds per-secret metadata encrypted alongside the ciphertext.
-// Encrypted with a key derived from the bucket's DEK so it is inaccessible
-// without both the master passphrase and (for LevelAdminWrapped) the admin password.
+// EncryptedMetadata holds per-secret metadata encrypted with a key derived
+// from the bucket DEK. Inaccessible without the bucket key.
 type EncryptedMetadata struct {
-	CreatedAt   time.Time `json:"ca"`
-	UpdatedAt   time.Time `json:"ua"`
-	AccessCount int       `json:"ac"`
-	LastAccess  time.Time `json:"la,omitempty"`
-	Version     int       `json:"v"`
-}
-
-// SaltEntry holds a versioned KDF salt. Defined now for the salt-rotation
-// milestone; not yet written to the database.
-type SaltEntry struct {
-	Version   int       `json:"v"`
-	Salt      []byte    `json:"s"`
-	CreatedAt time.Time `json:"ca"`
-	KeyLen    int       `json:"kl"`
+	CreatedAt   time.Time `msgpack:"ca"`
+	UpdatedAt   time.Time `msgpack:"ua"`
+	AccessCount int       `msgpack:"ac"`
+	LastAccess  time.Time `msgpack:"la,omitempty"`
+	Version     int       `msgpack:"v"`
 }
 
 // RotationWAL tracks the state of an in-progress key rotation.
-// Defined now for the crash-recovery milestone; not yet used in rotation.
+// Written to the metadata bucket before rotation begins. On crash, New()
+// reads this record and calls resumeRotation before opening the store.
 type RotationWAL struct {
 	Status      string    `json:"status"`
 	OldKeyHash  []byte    `json:"old_hash"`
 	NewKeyHash  []byte    `json:"new_hash"`
 	StartedAt   time.Time `json:"started"`
-	ShadowKeys  []string  `json:"shadows"`
+	LastKey     string    `json:"last_key"` // cursor: scheme:namespace:key of last completed record
 	SaltVersion int       `json:"salt_ver"`
 }
 
@@ -192,3 +169,6 @@ type StoreStats struct {
 	StorageEfficiency float64       `json:"storage_efficiency"`
 	KeyDerivation     string        `json:"key_derivation"`
 }
+
+// currentSchemaVersion is the schema version written by all new records.
+const currentSchemaVersion = 1

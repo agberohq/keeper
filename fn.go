@@ -73,10 +73,10 @@ func secureZero(b []byte) {
 	}
 }
 
-// isPolicyHashKey reports whether a policy bucket key is a hash entry
-// (i.e. ends with policyHashSuffix) and should be skipped during iteration.
+// isPolicyHashKey reports whether a policy bucket key is a metadata entry
+// (:hash or :hmac suffix) that should be skipped during policy iteration.
 func isPolicyHashKey(key string) bool {
-	return strings.HasSuffix(key, policyHashSuffix)
+	return strings.HasSuffix(key, policyHashSuffix) || strings.HasSuffix(key, policyHMACSuffix)
 }
 
 // parseKeyExtended extracts scheme, namespace, and key from input string.

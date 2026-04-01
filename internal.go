@@ -1,6 +1,7 @@
 package keeper
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -15,7 +16,6 @@ import (
 	pkgstore "github.com/agberohq/keeper/pkg/store"
 	"github.com/awnumar/memguard"
 	"github.com/olekukonko/errors"
-	"github.com/olekukonko/jack"
 	msgpack "github.com/vmihailenco/msgpack/v5"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/hkdf"
@@ -27,21 +27,7 @@ func marshalSecret(s *Secret) ([]byte, error) {
 }
 
 // unmarshalSecret decodes a Secret using msgpack.
-// Used on all records written by this version of keeper.
 func unmarshalSecret(data []byte, s *Secret) error {
-	return msgpack.Unmarshal(data, s)
-}
-
-// unmarshalSecretAny decodes a Secret from either msgpack or JSON.
-// Used only by reencryptAllWithKey and migrateBatch, which scan the full
-// database and may encounter records written by older versions of keeper
-// that used JSON encoding. All other read paths use unmarshalSecret because
-// they only ever read records written by SetNamespacedFull, which always
-// writes msgpack.
-func unmarshalSecretAny(data []byte, s *Secret) error {
-	if len(data) > 0 && data[0] == '{' {
-		return json.Unmarshal(data, s)
-	}
 	return msgpack.Unmarshal(data, s)
 }
 
@@ -92,8 +78,8 @@ func (s *Keeper) createNamespaceBucket(tx pkgstore.Tx, scheme, namespace string)
 }
 
 // bucketKeyBytes retrieves the DEK for scheme/namespace from the Envelope,
-// copies it to a plain slice for immediate use, and destroys the LockedBuffer.
-// The returned slice MUST be zeroed by the caller as soon as it is no longer needed.
+// copies it to a plain slice, and destroys the LockedBuffer.
+// The returned slice MUST be zeroed by the caller immediately after use.
 func (s *Keeper) bucketKeyBytes(scheme, namespace string) ([]byte, error) {
 	buf, err := s.envelope.Retrieve(scheme, namespace)
 	if err != nil {
@@ -115,8 +101,7 @@ func (s *Keeper) isBucketUnlocked(scheme, namespace string) bool {
 	}
 	policy, err := s.loadPolicy(scheme, namespace)
 	if err != nil {
-		// No policy — treat as password-only, inherits store state.
-		return true
+		return true // no policy — inherits store state
 	}
 	return policy.Level == LevelPasswordOnly
 }
@@ -139,9 +124,9 @@ func (s *Keeper) unlockBucketPasswordOnly(scheme, namespace string) error {
 	return nil
 }
 
-// unlockBucketAdminWrapped derives the KEK, unwraps the DEK, and holds it
-// in the Envelope. All authentication failures return ErrAuthFailed to
-// prevent admin ID enumeration (CVSS 5.3 / CWE-204).
+// unlockBucketAdminWrapped derives the KEK, unwraps the DEK, and places it
+// in the Envelope. All authentication failures return ErrAuthFailed to prevent
+// admin ID enumeration (CWE-204 / CVSS 5.3).
 func (s *Keeper) unlockBucketAdminWrapped(scheme, namespace, adminID string, adminPassword []byte) error {
 	policy, err := s.loadPolicy(scheme, namespace)
 	if err != nil {
@@ -150,9 +135,6 @@ func (s *Keeper) unlockBucketAdminWrapped(scheme, namespace, adminID string, adm
 	if policy.Level != LevelAdminWrapped {
 		return fmt.Errorf("bucket %s:%s is not LevelAdminWrapped", scheme, namespace)
 	}
-
-	// Return a single opaque error for any authentication failure.
-	// Do not distinguish "unknown admin" from "wrong password".
 	wrapped, ok := policy.WrappedDEKs[adminID]
 	if !ok {
 		s.logger.Fields("scheme", scheme, "namespace", namespace).Warn("unlock: admin not found")
@@ -164,11 +146,7 @@ func (s *Keeper) unlockBucketAdminWrapped(scheme, namespace, adminID string, adm
 		return err
 	}
 
-	// DeriveKEK is HKDF-SHA256 (≈1 µs) — no async wrapper needed.
-	// We do need a proper copy of masterBytes before zeroing the original,
-	// because a Go slice assignment (mb := masterBytes) aliases the same
-	// backing array. secureZero(masterBytes) would race with any concurrent
-	// reader of mb.
+	// Deep copy before zeroing — slice assignment aliases the backing array.
 	mbCopy := make([]byte, len(masterBytes))
 	copy(mbCopy, masterBytes)
 	secureZero(masterBytes)
@@ -247,95 +225,209 @@ func (s *Keeper) updateActivity() {
 	atomic.StoreInt64(&s.lastActivity, time.Now().UnixNano())
 }
 
-// reencryptAllWithKey re-encrypts every secret from oldKey to newKey.
-// For V1 records it also re-encrypts EncryptedMeta.
-// Uses rotationWALKey as a crash-detection marker.
+// reencryptAllWithKey re-encrypts every LevelPasswordOnly secret and its
+// metadata from oldKey to newKey.
+//
+// Crash safety: the WAL records status and a cursor (scheme:namespace:key of
+// the last successfully written record). Each record is committed in its own
+// bbolt.Update, which is atomic. On crash, New() reads the WAL and calls
+// resumeRotation to complete from the cursor.
 func (s *Keeper) reencryptAllWithKey(newKey, oldKey []byte) error {
 	if len(oldKey) == 0 {
 		return errors.New("old key is empty")
 	}
 
-	if err := s.db.Update(func(tx pkgstore.Tx) error {
-		b := tx.Bucket([]byte(metaBucket))
-		if b == nil {
-			return stdErrors.New("metadata bucket not found")
-		}
-		return b.Put([]byte(rotationWALKey), []byte(walStatusInProgress))
-	}); err != nil {
+	// Write WAL before touching any record.
+	oldHash := sha256.Sum256(oldKey)
+	newHash := sha256.Sum256(newKey)
+	wal := &RotationWAL{
+		Status:     walStatusInProgress,
+		OldKeyHash: oldHash[:],
+		NewKeyHash: newHash[:],
+		StartedAt:  time.Now(),
+	}
+	if err := s.writeRotationWAL(wal); err != nil {
 		return fmt.Errorf("failed to write rotation WAL: %w", err)
 	}
 	s.logger.Info("key rotation started")
 
-	if err := s.db.Update(func(tx pkgstore.Tx) error {
-		return tx.ForEach(func(name []byte, sb pkgstore.Bucket) error {
-			schemeName := string(name)
-			if schemeName == metaBucket || schemeName == policyBucket || schemeName == auditBucketRoot {
-				return nil
-			}
-			return sb.ForEach(func(nsName []byte, _ []byte) error {
-				if string(nsName) == metadataKey {
-					return nil
-				}
-				nb := sb.Bucket(nsName)
-				if nb == nil {
-					return nil
-				}
-				return nb.ForEach(func(k, v []byte) error {
-					if string(k) == metadataKey {
-						return nil
-					}
-					var secret Secret
-					if err := unmarshalSecretAny(v, &secret); err != nil {
-						return err
-					}
-
-					pt, err := s.decryptWithKey(secret.Ciphertext, oldKey)
-					if err != nil {
-						return fmt.Errorf("decrypt %s: %w", k, err)
-					}
-					ct, err := s.encryptWithKey(pt, newKey)
-					secureZero(pt)
-					if err != nil {
-						return fmt.Errorf("encrypt %s: %w", k, err)
-					}
-					secret.Ciphertext = ct
-
-					if secret.SchemaVersion >= secretSchemaV1 && len(secret.EncryptedMeta) > 0 {
-						oldMetaKey, merr := s.deriveMetaKey(oldKey)
-						if merr != nil {
-							return fmt.Errorf("derive old meta key: %w", merr)
-						}
-						meta, merr := s.decryptMetaWithKey(secret.EncryptedMeta, oldMetaKey)
-						secureZero(oldMetaKey)
-						if merr != nil {
-							return fmt.Errorf("decrypt meta %s: %w", k, merr)
-						}
-						newMetaKey, merr := s.deriveMetaKey(newKey)
-						if merr != nil {
-							return fmt.Errorf("derive new meta key: %w", merr)
-						}
-						newEM, merr := s.encryptMetaWithKey(meta, newMetaKey)
-						secureZero(newMetaKey)
-						if merr != nil {
-							return fmt.Errorf("encrypt meta %s: %w", k, merr)
-						}
-						secret.EncryptedMeta = newEM
-					} else if secret.SchemaVersion == secretSchemaV0 {
-						secret.Version++
-					}
-
-					data, err := marshalSecret(&secret)
-					if err != nil {
-						return err
-					}
-					return nb.Put(k, data)
-				})
-			})
-		})
-	}); err != nil {
+	if err := s.encryptAllRecords(newKey, oldKey, wal); err != nil {
 		return fmt.Errorf("re-encryption failed: %w", err)
 	}
 
+	return s.clearRotationWAL()
+}
+
+// encryptAllRecords iterates every secret bucket and re-encrypts each record
+// individually. The WAL cursor is updated after each successful record write.
+func (s *Keeper) encryptAllRecords(newKey, oldKey []byte, wal *RotationWAL) error {
+	var schemes []string
+	if err := s.db.View(func(tx pkgstore.Tx) error {
+		return tx.ForEach(func(name []byte, _ pkgstore.Bucket) error {
+			n := string(name)
+			if n != metaBucket && n != policyBucket && n != auditBucketRoot {
+				schemes = append(schemes, n)
+			}
+			return nil
+		})
+	}); err != nil {
+		return err
+	}
+
+	for _, schemeName := range schemes {
+		var namespaces []string
+		if err := s.db.View(func(tx pkgstore.Tx) error {
+			sb := tx.Bucket([]byte(schemeName))
+			if sb == nil {
+				return nil
+			}
+			return sb.ForEach(func(nsName []byte, _ []byte) error {
+				if string(nsName) != metadataKey {
+					namespaces = append(namespaces, string(nsName))
+				}
+				return nil
+			})
+		}); err != nil {
+			return err
+		}
+
+		for _, nsName := range namespaces {
+			var keys []string
+			if err := s.db.View(func(tx pkgstore.Tx) error {
+				nb := s.getNamespaceBucket(tx, schemeName, nsName)
+				if nb == nil {
+					return nil
+				}
+				return nb.ForEach(func(k, _ []byte) error {
+					if string(k) != metadataKey {
+						keys = append(keys, string(k))
+					}
+					return nil
+				})
+			}); err != nil {
+				return err
+			}
+
+			for _, key := range keys {
+				cursor := schemeName + ":" + nsName + ":" + key
+				// Skip records already processed before a crash.
+				if wal.LastKey != "" && cursor <= wal.LastKey {
+					continue
+				}
+				if err := s.reencryptRecord(schemeName, nsName, key, newKey, oldKey); err != nil {
+					return err
+				}
+				wal.LastKey = cursor
+				if err := s.writeRotationWAL(wal); err != nil {
+					return fmt.Errorf("failed to update rotation WAL cursor: %w", err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// reencryptRecord re-encrypts a single secret record in one atomic Update.
+func (s *Keeper) reencryptRecord(scheme, namespace, key string, newKey, oldKey []byte) error {
+	return s.db.Update(func(tx pkgstore.Tx) error {
+		nb := s.getNamespaceBucket(tx, scheme, namespace)
+		if nb == nil {
+			return nil
+		}
+		v := nb.Get([]byte(key))
+		if v == nil {
+			return nil
+		}
+		var secret Secret
+		if err := unmarshalSecret(v, &secret); err != nil {
+			return fmt.Errorf("unmarshal %s: %w", key, err)
+		}
+		pt, err := s.decryptWithKey(secret.Ciphertext, oldKey)
+		if err != nil {
+			return fmt.Errorf("decrypt %s: %w", key, err)
+		}
+		ct, err := s.encryptWithKey(pt, newKey)
+		secureZero(pt)
+		if err != nil {
+			return fmt.Errorf("encrypt %s: %w", key, err)
+		}
+		secret.Ciphertext = ct
+
+		if len(secret.EncryptedMeta) > 0 {
+			oldMetaKey, merr := s.deriveMetaKey(oldKey)
+			if merr != nil {
+				return fmt.Errorf("derive old meta key: %w", merr)
+			}
+			meta, merr := s.decryptMetaWithKey(secret.EncryptedMeta, oldMetaKey)
+			secureZero(oldMetaKey)
+			if merr != nil {
+				return fmt.Errorf("decrypt meta %s: %w", key, merr)
+			}
+			newMetaKey, merr := s.deriveMetaKey(newKey)
+			if merr != nil {
+				return fmt.Errorf("derive new meta key: %w", merr)
+			}
+			newEM, merr := s.encryptMetaWithKey(meta, newMetaKey)
+			secureZero(newMetaKey)
+			if merr != nil {
+				return fmt.Errorf("encrypt meta %s: %w", key, merr)
+			}
+			secret.EncryptedMeta = newEM
+		}
+
+		data, err := marshalSecret(&secret)
+		if err != nil {
+			return err
+		}
+		return nb.Put([]byte(key), data)
+	})
+}
+
+// resumeRotation continues a rotation that was interrupted by a crash.
+// Called from New() when hasIncompleteRotation() returns true.
+func (s *Keeper) resumeRotation(newKey, oldKey []byte) error {
+	wal, err := s.readRotationWAL()
+	if err != nil {
+		return fmt.Errorf("failed to read rotation WAL: %w", err)
+	}
+	s.logger.Fields("cursor", wal.LastKey).Info("resuming interrupted key rotation")
+	if err := s.encryptAllRecords(newKey, oldKey, wal); err != nil {
+		return fmt.Errorf("re-encryption resume failed: %w", err)
+	}
+	return s.clearRotationWAL()
+}
+
+func (s *Keeper) writeRotationWAL(wal *RotationWAL) error {
+	data, err := json.Marshal(wal)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx pkgstore.Tx) error {
+		b := tx.Bucket([]byte(metaBucket))
+		if b == nil {
+			return stdErrors.New("metadata bucket not found")
+		}
+		return b.Put([]byte(rotationWALKey), data)
+	})
+}
+
+func (s *Keeper) readRotationWAL() (*RotationWAL, error) {
+	var wal RotationWAL
+	err := s.db.View(func(tx pkgstore.Tx) error {
+		b := tx.Bucket([]byte(metaBucket))
+		if b == nil {
+			return stdErrors.New("metadata bucket not found")
+		}
+		data := b.Get([]byte(rotationWALKey))
+		if data == nil {
+			return stdErrors.New("rotation WAL not found")
+		}
+		return json.Unmarshal(data, &wal)
+	})
+	return &wal, err
+}
+
+func (s *Keeper) clearRotationWAL() error {
 	return s.db.Update(func(tx pkgstore.Tx) error {
 		b := tx.Bucket([]byte(metaBucket))
 		if b == nil {
@@ -429,8 +521,6 @@ func (s *Keeper) verifyMasterKey(key []byte) error {
 	return nil
 }
 
-// verifyArgon2Params returns the Argon2 parameters for verification hash
-// derivation, applying defaults where the config has zero values.
 func (s *Keeper) verifyArgon2Params() (t, m uint32, p uint8) {
 	t = s.config.VerifyArgon2Time
 	if t == 0 {
@@ -447,14 +537,37 @@ func (s *Keeper) verifyArgon2Params() (t, m uint32, p uint8) {
 	return
 }
 
-func policyHash(data []byte) string {
+// Policy HMAC key helpers.
+
+// derivePolicyKey produces a 32-byte HMAC key for policy authentication.
+// Distinct info string from the audit key — each key has one purpose.
+func derivePolicyKey(masterBytes []byte) ([]byte, error) {
+	r := hkdf.New(sha256.New, masterBytes, nil, []byte(hkdfInfoPolicyHMAC))
+	key := make([]byte, masterKeyLen)
+	if _, err := io.ReadFull(r, key); err != nil {
+		return nil, fmt.Errorf("policy key: HKDF expansion failed: %w", err)
+	}
+	return key, nil
+}
+
+// computePolicyHMAC returns HMAC-SHA256(policyKey, policyJSON).
+func computePolicyHMAC(policyKey, policyJSON []byte) string {
+	h := hmac.New(sha256.New, policyKey)
+	h.Write(policyJSON)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// policyHashIntegrity returns SHA-256(policyJSON) as hex — used before unlock.
+func policyHashIntegrity(data []byte) string {
 	h := sha256.Sum256(data)
 	return hex.EncodeToString(h[:])
 }
 
+// savePolicy persists a policy with both the unauthenticated SHA-256 hash and,
+// when the store is unlocked (policyKey available), an authenticated HMAC tag.
 func (s *Keeper) savePolicy(policy *BucketSecurityPolicy) error {
 	return s.db.Update(func(tx pkgstore.Tx) error {
-		policies, err := tx.CreateBucketIfNotExists([]byte(policyBucket))
+		bucket, err := tx.CreateBucketIfNotExists([]byte(policyBucket))
 		if err != nil {
 			return err
 		}
@@ -463,13 +576,26 @@ func (s *Keeper) savePolicy(policy *BucketSecurityPolicy) error {
 		if err != nil {
 			return err
 		}
-		if err := policies.Put([]byte(key), data); err != nil {
+		if err := bucket.Put([]byte(key), data); err != nil {
 			return err
 		}
-		return policies.Put([]byte(key+policyHashSuffix), []byte(policyHash(data)))
+		// Always write the unauthenticated hash for pre-unlock integrity checks.
+		if err := bucket.Put([]byte(key+policyHashSuffix), []byte(policyHashIntegrity(data))); err != nil {
+			return err
+		}
+		// Write the authenticated HMAC when the policy key is available.
+		if len(s.policyKey) > 0 {
+			tag := computePolicyHMAC(s.policyKey, data)
+			if err := bucket.Put([]byte(key+policyHMACSuffix), []byte(tag)); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 
+// loadPolicies populates schemeRegistry at startup (before unlock).
+// Only SHA-256 hash verification is available at this stage.
 func (s *Keeper) loadPolicies() error {
 	return s.db.View(func(tx pkgstore.Tx) error {
 		policies := tx.Bucket([]byte(policyBucket))
@@ -491,6 +617,9 @@ func (s *Keeper) loadPolicies() error {
 	})
 }
 
+// loadPolicy returns the policy for scheme/namespace, verifying the HMAC when
+// the store is unlocked. Falls back to SHA-256 integrity check when no HMAC
+// tag is stored (e.g. policies created before this version).
 func (s *Keeper) loadPolicy(scheme, namespace string) (*BucketSecurityPolicy, error) {
 	key := fmt.Sprintf("%s:%s", scheme, namespace)
 	if p, ok := s.schemeRegistry[key]; ok {
@@ -506,11 +635,31 @@ func (s *Keeper) loadPolicy(scheme, namespace string) (*BucketSecurityPolicy, er
 		if data == nil {
 			return ErrPolicyNotFound
 		}
-		if storedHash := policies.Get([]byte(key + policyHashSuffix)); storedHash != nil {
-			if policyHash(data) != string(storedHash) {
-				return fmt.Errorf("policy tamper detected for %s", key)
+
+		// Prefer HMAC verification when the store is unlocked and a tag exists.
+		if len(s.policyKey) > 0 {
+			if tag := policies.Get([]byte(key + policyHMACSuffix)); tag != nil {
+				expected := computePolicyHMAC(s.policyKey, data)
+				if !hmac.Equal([]byte(expected), tag) {
+					return fmt.Errorf("%w: HMAC mismatch for policy %s", ErrPolicySignature, key)
+				}
+			} else {
+				// No HMAC tag yet — fall back to SHA-256 and upgrade on next save.
+				if storedHash := policies.Get([]byte(key + policyHashSuffix)); storedHash != nil {
+					if policyHashIntegrity(data) != string(storedHash) {
+						return fmt.Errorf("policy integrity check failed for %s", key)
+					}
+				}
+			}
+		} else {
+			// Pre-unlock: SHA-256 only.
+			if storedHash := policies.Get([]byte(key + policyHashSuffix)); storedHash != nil {
+				if policyHashIntegrity(data) != string(storedHash) {
+					return fmt.Errorf("policy integrity check failed for %s", key)
+				}
 			}
 		}
+
 		return json.Unmarshal(data, &policy)
 	})
 	if err != nil {
@@ -520,12 +669,48 @@ func (s *Keeper) loadPolicy(scheme, namespace string) (*BucketSecurityPolicy, er
 	return &policy, nil
 }
 
+// upgradePolicyHMACs rewrites all policy records with an authenticated HMAC tag.
+// Called from UnlockDatabase after policyKey is set. Policies created before
+// this version only have a SHA-256 hash; this upgrades them in one pass.
+func (s *Keeper) upgradePolicyHMACs() error {
+	if len(s.policyKey) == 0 {
+		return nil
+	}
+	return s.db.Update(func(tx pkgstore.Tx) error {
+		policies := tx.Bucket([]byte(policyBucket))
+		if policies == nil {
+			return nil
+		}
+		var toUpgrade []struct{ key, data []byte }
+		_ = policies.ForEach(func(k, v []byte) error {
+			key := string(k)
+			if isPolicyHashKey(key) {
+				return nil
+			}
+			// Only upgrade if no HMAC tag yet.
+			if policies.Get([]byte(key+policyHMACSuffix)) == nil {
+				kCopy := make([]byte, len(k))
+				copy(kCopy, k)
+				vCopy := make([]byte, len(v))
+				copy(vCopy, v)
+				toUpgrade = append(toUpgrade, struct{ key, data []byte }{kCopy, vCopy})
+			}
+			return nil
+		})
+		for _, item := range toUpgrade {
+			tag := computePolicyHMAC(s.policyKey, item.data)
+			if err := policies.Put(append(item.key, []byte(policyHMACSuffix)...), []byte(tag)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (s *Keeper) appendAuditEvent(event *BucketEvent) error {
 	if s.auditStore == nil {
 		return nil
 	}
-	// Policy creation events are synchronous: CreateBucket must not return
-	// before the audit record is committed.
 	if s.config.Jack.Pool != nil && event.EventType != "created" {
 		ev := event
 		s.config.Jack.Pool.Do(func() {
@@ -571,8 +756,7 @@ func (s *Keeper) incrementAccessCount(scheme, namespace, key string) {
 		if err := unmarshalSecret(data, &secret); err != nil {
 			return err
 		}
-
-		if secret.SchemaVersion >= secretSchemaV1 && len(secret.EncryptedMeta) > 0 {
+		if len(secret.EncryptedMeta) > 0 {
 			bucketDEK, err := s.bucketKeyBytes(scheme, namespace)
 			if err != nil {
 				return nil
@@ -589,11 +773,7 @@ func (s *Keeper) incrementAccessCount(scheme, namespace, key string) {
 				return nil
 			}
 			secret.EncryptedMeta = em
-		} else {
-			secret.AccessCount++
-			secret.LastAccess = time.Now()
 		}
-
 		newData, err := marshalSecret(&secret)
 		if err != nil {
 			return err
@@ -613,10 +793,6 @@ func (s *Keeper) audit(action, scheme, namespace, key string, success bool, dura
 
 // Metadata encryption helpers.
 
-// deriveMetaKey produces a 32-byte encryption key for EncryptedMetadata
-// from a bucket DEK using HKDF-SHA256. The metadata key is bucket-scoped:
-// inaccessible without both the master passphrase and (for LevelAdminWrapped)
-// the admin password.
 func (s *Keeper) deriveMetaKey(bucketDEK []byte) ([]byte, error) {
 	r := hkdf.New(sha256.New, bucketDEK, nil, []byte(hkdfInfoMetaKey))
 	key := make([]byte, masterKeyLen)
@@ -664,181 +840,4 @@ func (s *Keeper) decryptMetaWithKey(data, metaKey []byte) (*EncryptedMetadata, e
 		return nil, fmt.Errorf("%w: %v", ErrMetadataDecrypt, err)
 	}
 	return &meta, nil
-}
-
-// Background metadata migration.
-
-// runMigrations creates and starts a jack.Looper that migrates V0 records to
-// V1 in small batches, yielding between each batch to avoid blocking the data
-// plane. The Looper stops itself after signalling migrationDone.
-func (s *Keeper) runMigrations() *jack.Looper {
-	looper := jack.NewLooper(
-		jack.Func(func() error {
-			done, err := s.migrateBatch()
-			if err != nil {
-				s.audit("migration_batch_error", "", "", "", false, 0)
-			}
-			if done {
-				select {
-				case s.migrationDone <- struct{}{}:
-				default:
-				}
-			}
-			return err
-		}),
-		jack.WithLooperInterval(migrationYieldMs),
-		jack.WithLooperImmediate(true),
-	)
-	looper.Start()
-	return looper
-}
-
-// migrateBatch migrates up to migrationBatchSize V0 records to V1.
-// Returns (true, nil) when all records have been migrated.
-func (s *Keeper) migrateBatch() (bool, error) {
-	if s.isMigrationComplete() {
-		return true, nil
-	}
-
-	cursor, err := s.migrationCursor()
-	if err != nil {
-		return false, err
-	}
-
-	count := 0
-	batchFull := false
-
-	err = s.db.Update(func(tx pkgstore.Tx) error {
-		return tx.ForEach(func(name []byte, sb pkgstore.Bucket) error {
-			schemeName := string(name)
-			if schemeName == metaBucket || schemeName == policyBucket || schemeName == auditBucketRoot {
-				return nil
-			}
-			return sb.ForEach(func(nsName []byte, _ []byte) error {
-				if string(nsName) == metadataKey {
-					return nil
-				}
-				nb := sb.Bucket(nsName)
-				if nb == nil {
-					return nil
-				}
-				return nb.ForEach(func(k, v []byte) error {
-					if batchFull {
-						return nil
-					}
-					if string(k) == metadataKey {
-						return nil
-					}
-					curKey := schemeName + ":" + string(nsName) + ":" + string(k)
-					if cursor != "" && curKey <= cursor {
-						return nil
-					}
-					var secret Secret
-					if err := unmarshalSecretAny(v, &secret); err != nil {
-						return nil
-					}
-					if secret.SchemaVersion != secretSchemaV0 {
-						return nil
-					}
-					bucketDEK, err := s.bucketKeyBytes(schemeName, string(nsName))
-					if err != nil {
-						return nil // bucket locked; skip silently
-					}
-					defer secureZero(bucketDEK)
-
-					meta := &EncryptedMetadata{
-						CreatedAt:   secret.CreatedAt,
-						UpdatedAt:   secret.UpdatedAt,
-						AccessCount: secret.AccessCount,
-						LastAccess:  secret.LastAccess,
-						Version:     secret.Version,
-					}
-					em, err := s.encryptMeta(meta, bucketDEK)
-					if err != nil {
-						return nil
-					}
-					newSecret := Secret{
-						Ciphertext:    secret.Ciphertext,
-						EncryptedMeta: em,
-						SchemaVersion: secretSchemaV2,
-					}
-					data, err := marshalSecret(&newSecret)
-					if err != nil {
-						return nil
-					}
-					if err := nb.Put(k, data); err != nil {
-						return err
-					}
-					count++
-					if count >= migrationBatchSize {
-						batchFull = true
-						_ = s.storeMigrationCursorTx(tx, curKey)
-					}
-					return nil
-				})
-			})
-		})
-	})
-	if err != nil {
-		return false, err
-	}
-
-	if batchFull {
-		return false, nil
-	}
-	return true, s.markMigrationDone()
-}
-
-func (s *Keeper) isMigrationComplete() bool {
-	var done bool
-	_ = s.db.View(func(tx pkgstore.Tx) error {
-		b := tx.Bucket([]byte(metaBucket))
-		if b == nil {
-			return nil
-		}
-		done = b.Get([]byte(migrationDoneKey)) != nil
-		return nil
-	})
-	return done
-}
-
-func (s *Keeper) migrationCursor() (string, error) {
-	var cursor string
-	err := s.db.View(func(tx pkgstore.Tx) error {
-		b := tx.Bucket([]byte(metaBucket))
-		if b == nil {
-			return nil
-		}
-		if v := b.Get([]byte(migrationWALKey)); v != nil {
-			cursor = string(v)
-		}
-		return nil
-	})
-	return cursor, err
-}
-
-// storeMigrationCursorTx writes the migration cursor inside an existing transaction.
-func (s *Keeper) storeMigrationCursorTx(tx pkgstore.Tx, cursor string) error {
-	b := tx.Bucket([]byte(metaBucket))
-	if b == nil {
-		return nil
-	}
-	return b.Put([]byte(migrationWALKey), []byte(cursor))
-}
-
-func (s *Keeper) markMigrationDone() error {
-	err := s.db.Update(func(tx pkgstore.Tx) error {
-		b := tx.Bucket([]byte(metaBucket))
-		if b == nil {
-			return nil
-		}
-		if err := b.Put([]byte(migrationDoneKey), []byte("1")); err != nil {
-			return err
-		}
-		return b.Delete([]byte(migrationWALKey))
-	})
-	if err == nil {
-		s.logger.Info("metadata migration completed — all records are now schema V2")
-	}
-	return err
 }

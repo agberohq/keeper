@@ -88,6 +88,18 @@ func (s *Keeper) Rotate(newPassphrase []byte) error {
 	s.auditStore.setSigningKey(newAuditKey)
 	secureZero(newAuditKey)
 
+	// Re-derive the policy HMAC key from the new master and rewrite all
+	// policy records with the new tag.
+	newPolicyKey, err := derivePolicyKey(newKey)
+	if err != nil {
+		return fmt.Errorf("failed to derive new policy key: %w", err)
+	}
+	secureZero(s.policyKey)
+	s.policyKey = newPolicyKey
+	if err := s.upgradePolicyHMACs(); err != nil {
+		s.logger.Fields("err", err).Warn("policy HMAC rewrite after rotation failed — continuing")
+	}
+
 	// Re-seed the Envelope for all LevelPasswordOnly buckets with the new key.
 	for _, policy := range s.schemeRegistry {
 		if policy.Level == LevelPasswordOnly {

@@ -1,7 +1,5 @@
 package keeper
 
-import "time"
-
 // DB bucket names.
 const (
 	defaultScheme    = "default"
@@ -18,29 +16,33 @@ const (
 )
 
 // metadataKey is the reserved sentinel key inside namespace buckets.
-// ForEach iterations skip this key; it holds EncryptedMetadata once
-// a record has been migrated to secretSchemaV1.
+// ForEach iterations skip this key.
 const metadataKey = "__metadata__"
 
 // Keys stored inside the metadata bucket.
 const (
-	rotationWALKey      = "__rotation_wal__"
-	migrationWALKey     = "__migration_wal__"
-	migrationDoneKey    = "__migration_done__"
 	metaSaltKey         = "salt"
 	metaVerifyKey       = "verify"
+	rotationWALKey      = "__rotation_wal__"
 	walStatusInProgress = "in_progress"
+	walStatusComplete   = "complete"
 )
 
-// policyHashSuffix is appended to a policy key when storing its integrity hash.
+// policyHashSuffix stores the unauthenticated SHA-256 integrity hash written
+// before the store is unlocked (no HMAC key is available yet).
 const policyHashSuffix = ":hash"
+
+// policyHMACSuffix stores the authenticated HMAC-SHA256 tag written after
+// the store is unlocked. loadPolicy verifies this tag when present.
+const policyHMACSuffix = ":hmac"
 
 // HKDF info strings used as domain-separation labels.
 // Changing any of these values is a breaking change to the on-disk format.
 const (
-	hkdfInfoKEK      = "keeper-kek-v1"
-	hkdfInfoAuditKey = "keeper-audit-hmac-v1"
-	hkdfInfoMetaKey  = "keeper-metadata-v1"
+	hkdfInfoKEK        = "keeper-kek-v1"
+	hkdfInfoAuditKey   = "keeper-audit-hmac-v1"
+	hkdfInfoMetaKey    = "keeper-metadata-v1"
+	hkdfInfoPolicyHMAC = "keeper-policy-hmac-v1"
 )
 
 // argon2VerificationSalt is the fixed domain-separation salt passed to
@@ -62,22 +64,6 @@ const (
 	argon2OutLen = 32
 )
 
-// Secret schema versions.
-// V0: JSON encoding, plaintext metadata fields (legacy, read-only decode path).
-// V1: JSON encoding, metadata encrypted in EncryptedMeta.
-// V2: msgpack encoding, metadata encrypted in EncryptedMeta (current write format).
-const (
-	secretSchemaV0 = 0
-	secretSchemaV1 = 1
-	secretSchemaV2 = 2
-)
-
-// Background metadata migration settings.
-const (
-	migrationBatchSize = 100
-	migrationYieldMs   = 10 * time.Millisecond
-)
-
 // Audit chain constants.
 const (
 	auditSnapshotEvery    = 1000
@@ -85,8 +71,6 @@ const (
 )
 
 // SecurityLevel values for BucketSecurityPolicy.
-// Declared here so the type stays in types.go while the values live alongside
-// all other constants.
 const (
 	LevelPasswordOnly SecurityLevel = "password_only"
 	LevelAdminWrapped SecurityLevel = "admin_wrapped"
