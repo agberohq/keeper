@@ -307,13 +307,13 @@ func TestAdminWrapped_FullLifecycle(t *testing.T) {
 
 	// Wrong admin password fails.
 	store.LockBucket("finance", "secrets")
-	if err := store.UnlockBucket("finance", "secrets", "alice", []byte("wrongpass")); err != ErrInvalidPassphrase {
-		t.Errorf("wrong pass: want ErrInvalidPassphrase, got %v", err)
+	if err := store.UnlockBucket("finance", "secrets", "alice", []byte("wrongpass")); !errors.Is(err, ErrAuthFailed) {
+		t.Errorf("wrong pass: want ErrAuthFailed, got %v", err)
 	}
 
-	// Unknown adminID fails.
-	if err := store.UnlockBucket("finance", "secrets", "charlie", []byte("pass")); !errors.Is(err, ErrAdminNotFound) {
-		t.Errorf("unknown admin: want ErrAdminNotFound, got %v", err)
+	// Unknown adminID fails with the same opaque error.
+	if err := store.UnlockBucket("finance", "secrets", "charlie", []byte("pass")); !errors.Is(err, ErrAuthFailed) {
+		t.Errorf("unknown admin: want ErrAuthFailed, got %v", err)
 	}
 }
 
@@ -327,10 +327,10 @@ func TestAdminWrapped_RevokeAdmin(t *testing.T) {
 		t.Fatalf("RevokeAdmin: %v", err)
 	}
 
-	// Alice can no longer unlock.
+	// Alice can no longer unlock — returns the same opaque auth error.
 	store.LockBucket("a", "b")
-	if err := store.UnlockBucket("a", "b", "alice", []byte("alicepass")); !errors.Is(err, ErrAdminNotFound) {
-		t.Errorf("revoked admin: want ErrAdminNotFound, got %v", err)
+	if err := store.UnlockBucket("a", "b", "alice", []byte("alicepass")); !errors.Is(err, ErrAuthFailed) {
+		t.Errorf("revoked admin: want ErrAuthFailed, got %v", err)
 	}
 
 	// Bob still can.

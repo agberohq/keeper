@@ -83,15 +83,18 @@ func TestEncryptDecrypt_WrongBucket(t *testing.T) {
 	store.CreateBucket("s1", "n1", LevelAdminWrapped, "t")
 	store.CreateBucket("s2", "n2", LevelAdminWrapped, "t")
 
-	// Adding the first admin auto-unlocks and seeds the unique DEK into the envelope
-	store.AddAdminToPolicy("s1", "n1", "admin", []byte("pass"))
-	store.AddAdminToPolicy("s2", "n2", "admin", []byte("pass"))
+	// Adding the first admin auto-unlocks and seeds the unique DEK into the Envelope.
+	if err := store.AddAdminToPolicy("s1", "n1", "admin", []byte("pass1")); err != nil {
+		t.Fatalf("AddAdminToPolicy s1: %v", err)
+	}
+	if err := store.AddAdminToPolicy("s2", "n2", "admin", []byte("pass2")); err != nil {
+		t.Fatalf("AddAdminToPolicy s2: %v", err)
+	}
 
 	ct, err := store.encrypt([]byte("secret"), "s1", "n1")
 	if err != nil {
 		t.Fatalf("encrypt failed: %v", err)
 	}
-
 	if _, err := store.decrypt(ct, "s2", "n2"); err == nil {
 		t.Error("decrypt with wrong bucket key should fail")
 	}

@@ -63,11 +63,13 @@ const (
 )
 
 // Secret schema versions.
-// V0 is the original format with plaintext metadata fields.
-// V1 stores metadata encrypted inside EncryptedMeta.
+// V0: JSON encoding, plaintext metadata fields (legacy, read-only decode path).
+// V1: JSON encoding, metadata encrypted in EncryptedMeta.
+// V2: msgpack encoding, metadata encrypted in EncryptedMeta (current write format).
 const (
 	secretSchemaV0 = 0
 	secretSchemaV1 = 1
+	secretSchemaV2 = 2
 )
 
 // Background metadata migration settings.

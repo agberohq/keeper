@@ -3,7 +3,6 @@ package keeper
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,7 +14,7 @@ import (
 	"github.com/agberohq/keeper/pkg/crypt"
 	pkgstore "github.com/agberohq/keeper/pkg/store"
 	"github.com/awnumar/memguard"
-	"github.com/olekukonko/jack"
+	jack "github.com/olekukonko/jack"
 	"github.com/olekukonko/ll"
 )
 
@@ -122,6 +121,7 @@ func New(config Config, opts ...func(*Config)) (*Keeper, error) {
 		db:             db,
 		locked:         true,
 		config:         config,
+		logger:         config.Logger.Namespace("keeper"),
 		defaultScheme:  config.DefaultScheme,
 		defaultNs:      config.DefaultNamespace,
 		metrics:        &core.Metrics{},
@@ -230,6 +230,7 @@ func (s *Keeper) CreateBucket(scheme, namespace string, level SecurityLevel, cre
 			s.audit("seed_new_bucket_failed", scheme, namespace, "", false, 0)
 		}
 	}
+	s.logger.Fields("scheme", scheme, "namespace", namespace, "level", string(level), "createdBy", createdBy).Info("bucket created")
 	return nil
 }
 
@@ -485,6 +486,7 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 	// Start background metadata migration.
 	s.migrationLoop = s.runMigrations()
 
+	s.logger.Fields("defaultScheme", s.defaultScheme, "defaultNs", s.defaultNs).Info("store unlocked")
 	s.audit("unlock_database", "", "", "", true, 0)
 	return nil
 }
@@ -516,6 +518,7 @@ func (s *Keeper) Lock() error {
 		s.master = nil
 	}
 	s.locked = true
+	s.logger.Info("store locked")
 	s.audit("lock", "", "", "", true, 0)
 	return nil
 }
@@ -583,7 +586,7 @@ func (s *Keeper) GetNamespacedFull(scheme, namespace, key string) ([]byte, error
 		if data == nil {
 			return ErrKeyNotFound
 		}
-		return json.Unmarshal(data, &secret)
+		return unmarshalSecret(data, &secret)
 	}); err != nil {
 		s.metrics.IncrementReadError()
 		s.audit("get", scheme, namespace, key, false, time.Since(start))
@@ -593,6 +596,7 @@ func (s *Keeper) GetNamespacedFull(scheme, namespace, key string) ([]byte, error
 	plaintext, err := s.decrypt(secret.Ciphertext, scheme, namespace)
 	if err != nil {
 		s.metrics.IncrementDecryptError()
+		s.logger.Fields("scheme", scheme, "namespace", namespace, "key", key, "err", err).Error("decryption failed")
 		s.audit("get", scheme, namespace, key, false, time.Since(start))
 		return nil, fmt.Errorf("decryption failed: %w", err)
 	}
@@ -709,7 +713,7 @@ func (s *Keeper) SetNamespacedFull(scheme, namespace, key string, value []byte) 
 			return nil
 		}
 		if data := b.Get([]byte(key)); data != nil {
-			json.Unmarshal(data, &existing)
+			unmarshalSecret(data, &existing)
 		}
 		return nil
 	})
@@ -717,6 +721,7 @@ func (s *Keeper) SetNamespacedFull(scheme, namespace, key string, value []byte) 
 	ciphertext, err := s.encrypt(value, scheme, namespace)
 	if err != nil {
 		s.metrics.IncrementEncryptError()
+		s.logger.Fields("scheme", scheme, "namespace", namespace, "key", key, "err", err).Error("encryption failed")
 		s.audit("set", scheme, namespace, key, false, time.Since(start))
 		return fmt.Errorf("encryption failed: %w", err)
 	}
@@ -733,7 +738,7 @@ func (s *Keeper) SetNamespacedFull(scheme, namespace, key string, value []byte) 
 	var createdAt time.Time
 	var accessCount, prevVersion int
 
-	if existing.SchemaVersion == secretSchemaV1 && len(existing.EncryptedMeta) > 0 {
+	if existing.SchemaVersion >= secretSchemaV1 && len(existing.EncryptedMeta) > 0 {
 		if prev, merr := s.decryptMeta(existing.EncryptedMeta, bucketDEK); merr == nil {
 			createdAt = prev.CreatedAt
 			accessCount = prev.AccessCount
@@ -764,7 +769,7 @@ func (s *Keeper) SetNamespacedFull(scheme, namespace, key string, value []byte) 
 	secret := Secret{
 		Ciphertext:    ciphertext,
 		EncryptedMeta: em,
-		SchemaVersion: secretSchemaV1,
+		SchemaVersion: secretSchemaV2,
 	}
 
 	if err := s.db.Update(func(tx pkgstore.Tx) error {
@@ -772,7 +777,7 @@ func (s *Keeper) SetNamespacedFull(scheme, namespace, key string, value []byte) 
 		if err != nil {
 			return err
 		}
-		data, err := json.Marshal(secret)
+		data, err := marshalSecret(&secret)
 		if err != nil {
 			return err
 		}
@@ -891,7 +896,7 @@ func (s *Keeper) CompareAndSwapNamespacedFull(scheme, namespace, key string, old
 			return ErrKeyNotFound
 		}
 		var secret Secret
-		if err := json.Unmarshal(data, &secret); err != nil {
+		if err := unmarshalSecret(data, &secret); err != nil {
 			return err
 		}
 		cur, err := s.decryptWithKey(secret.Ciphertext, casKey)
@@ -910,7 +915,7 @@ func (s *Keeper) CompareAndSwapNamespacedFull(scheme, namespace, key string, old
 		}
 		secret.Ciphertext = ct
 
-		if secret.SchemaVersion == secretSchemaV1 && len(secret.EncryptedMeta) > 0 {
+		if secret.SchemaVersion >= secretSchemaV1 && len(secret.EncryptedMeta) > 0 {
 			metaKey, merr := s.deriveMetaKey(casKey)
 			if merr == nil {
 				if meta, merr := s.decryptMetaWithKey(secret.EncryptedMeta, metaKey); merr == nil {
@@ -926,7 +931,7 @@ func (s *Keeper) CompareAndSwapNamespacedFull(scheme, namespace, key string, old
 			secret.Version++
 		}
 
-		nd, err := json.Marshal(secret)
+		nd, err := marshalSecret(&secret)
 		if err != nil {
 			return err
 		}
@@ -1228,12 +1233,12 @@ func (s *Keeper) Stats() (*StoreStats, error) {
 					nsStats.TotalSize += int64(len(v))
 
 					var secret Secret
-					if err := json.Unmarshal(v, &secret); err != nil {
+					if err := unmarshalSecret(v, &secret); err != nil {
 						return nil
 					}
 
 					var meta *EncryptedMetadata
-					if secret.SchemaVersion == secretSchemaV1 && len(secret.EncryptedMeta) > 0 && bucketDEK != nil {
+					if secret.SchemaVersion >= secretSchemaV1 && len(secret.EncryptedMeta) > 0 && bucketDEK != nil {
 						meta, _ = s.decryptMeta(secret.EncryptedMeta, bucketDEK)
 					} else if secret.SchemaVersion == secretSchemaV0 && !secret.CreatedAt.IsZero() {
 						meta = &EncryptedMetadata{

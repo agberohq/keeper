@@ -33,6 +33,11 @@ var (
 	ErrPolicySignature    = errors.New("policy signature verification failed")
 	ErrMetadataDecrypt    = errors.New("metadata decryption failed")
 	ErrMigrationActive    = errors.New("background migration in progress")
+	// ErrAuthFailed is the single error returned for any authentication failure
+	// in public-facing methods (UnlockBucket, UnlockDatabase). It deliberately
+	// does not distinguish between "wrong password" and "unknown admin ID" to
+	// prevent admin ID enumeration attacks (CVSS 5.3 / CWE-204).
+	ErrAuthFailed = errors.New("authentication failed")
 )
 
 // SecurityLevel defines the key-management model for a bucket.

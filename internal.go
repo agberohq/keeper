@@ -15,10 +15,45 @@ import (
 	pkgstore "github.com/agberohq/keeper/pkg/store"
 	"github.com/awnumar/memguard"
 	"github.com/olekukonko/errors"
-	jack "github.com/olekukonko/jack"
+	"github.com/olekukonko/jack"
+	msgpack "github.com/vmihailenco/msgpack/v5"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/hkdf"
 )
+
+// marshalSecret encodes a Secret using msgpack.
+func marshalSecret(s *Secret) ([]byte, error) {
+	return msgpack.Marshal(s)
+}
+
+// unmarshalSecret decodes a Secret using msgpack.
+// Used on all records written by this version of keeper.
+func unmarshalSecret(data []byte, s *Secret) error {
+	return msgpack.Unmarshal(data, s)
+}
+
+// unmarshalSecretAny decodes a Secret from either msgpack or JSON.
+// Used only by reencryptAllWithKey and migrateBatch, which scan the full
+// database and may encounter records written by older versions of keeper
+// that used JSON encoding. All other read paths use unmarshalSecret because
+// they only ever read records written by SetNamespacedFull, which always
+// writes msgpack.
+func unmarshalSecretAny(data []byte, s *Secret) error {
+	if len(data) > 0 && data[0] == '{' {
+		return json.Unmarshal(data, s)
+	}
+	return msgpack.Unmarshal(data, s)
+}
+
+// marshalEncryptedMetadata encodes EncryptedMetadata using msgpack.
+func marshalEncryptedMetadata(m *EncryptedMetadata) ([]byte, error) {
+	return msgpack.Marshal(m)
+}
+
+// unmarshalEncryptedMetadata decodes EncryptedMetadata using msgpack.
+func unmarshalEncryptedMetadata(data []byte, m *EncryptedMetadata) error {
+	return msgpack.Unmarshal(data, m)
+}
 
 func (s *Keeper) initBuckets() error {
 	return s.db.Update(func(tx pkgstore.Tx) error {
@@ -100,12 +135,13 @@ func (s *Keeper) unlockBucketPasswordOnly(scheme, namespace string) error {
 		return fmt.Errorf("failed to allocate buffer for master key")
 	}
 	s.envelope.Hold(scheme, namespace, buf)
+	s.logger.Fields("scheme", scheme, "namespace", namespace).Debug("bucket seeded (password-only)")
 	return nil
 }
 
 // unlockBucketAdminWrapped derives the KEK, unwraps the DEK, and holds it
-// in the Envelope. DeriveKEK (Argon2id) runs inside jack.Async so the
-// calling goroutine is not blocked during the CPU-intensive derivation.
+// in the Envelope. All authentication failures return ErrAuthFailed to
+// prevent admin ID enumeration (CVSS 5.3 / CWE-204).
 func (s *Keeper) unlockBucketAdminWrapped(scheme, namespace, adminID string, adminPassword []byte) error {
 	policy, err := s.loadPolicy(scheme, namespace)
 	if err != nil {
@@ -114,9 +150,13 @@ func (s *Keeper) unlockBucketAdminWrapped(scheme, namespace, adminID string, adm
 	if policy.Level != LevelAdminWrapped {
 		return fmt.Errorf("bucket %s:%s is not LevelAdminWrapped", scheme, namespace)
 	}
+
+	// Return a single opaque error for any authentication failure.
+	// Do not distinguish "unknown admin" from "wrong password".
 	wrapped, ok := policy.WrappedDEKs[adminID]
 	if !ok {
-		return fmt.Errorf("%w: admin %q", ErrAdminNotFound, adminID)
+		s.logger.Fields("scheme", scheme, "namespace", namespace).Warn("unlock: admin not found")
+		return ErrAuthFailed
 	}
 
 	masterBytes, err := s.master.Bytes()
@@ -124,25 +164,26 @@ func (s *Keeper) unlockBucketAdminWrapped(scheme, namespace, adminID string, adm
 		return err
 	}
 
-	// Capture values for the goroutine; masterBytes is zeroed after Await.
-	salt := policy.DEKSalt
-	mb := masterBytes
-	ap := adminPassword
-	future := jack.Async(func() ([]byte, error) {
-		return DeriveKEK(mb, ap, salt)
-	})
+	// DeriveKEK is HKDF-SHA256 (≈1 µs) — no async wrapper needed.
+	// We do need a proper copy of masterBytes before zeroing the original,
+	// because a Go slice assignment (mb := masterBytes) aliases the same
+	// backing array. secureZero(masterBytes) would race with any concurrent
+	// reader of mb.
+	mbCopy := make([]byte, len(masterBytes))
+	copy(mbCopy, masterBytes)
+	secureZero(masterBytes)
+	defer secureZero(mbCopy)
 
-	kek, err := future.Await()
+	kek, err := DeriveKEK(mbCopy, adminPassword, policy.DEKSalt)
 	if err != nil {
-		return err
+		s.logger.Fields("scheme", scheme, "namespace", namespace, "err", err).Error("unlock: KEK derivation failed")
+		return ErrAuthFailed
 	}
 
-	// wait for future to finish
-	secureZero(masterBytes)
-
-	dekEnc, err := UnwrapDEK(wrapped, kek) // kek is zeroed inside UnwrapDEK
+	dekEnc, err := UnwrapDEK(wrapped, kek) // kek zeroed inside UnwrapDEK
 	if err != nil {
-		return err
+		s.logger.Fields("scheme", scheme, "namespace", namespace).Warn("unlock: DEK unwrap failed")
+		return ErrAuthFailed
 	}
 	dekBuf, err := dekEnc.Open()
 	if err != nil {
@@ -154,6 +195,7 @@ func (s *Keeper) unlockBucketAdminWrapped(scheme, namespace, adminID string, adm
 		s.jackReaper.Touch(scheme + ":" + namespace)
 	}
 
+	s.logger.Fields("scheme", scheme, "namespace", namespace, "admin", adminID).Info("bucket unlocked")
 	_ = s.policyChain.AppendEvent(scheme, namespace, "unlocked",
 		map[string]string{"admin": adminID})
 	return nil
@@ -222,6 +264,7 @@ func (s *Keeper) reencryptAllWithKey(newKey, oldKey []byte) error {
 	}); err != nil {
 		return fmt.Errorf("failed to write rotation WAL: %w", err)
 	}
+	s.logger.Info("key rotation started")
 
 	if err := s.db.Update(func(tx pkgstore.Tx) error {
 		return tx.ForEach(func(name []byte, sb pkgstore.Bucket) error {
@@ -242,7 +285,7 @@ func (s *Keeper) reencryptAllWithKey(newKey, oldKey []byte) error {
 						return nil
 					}
 					var secret Secret
-					if err := json.Unmarshal(v, &secret); err != nil {
+					if err := unmarshalSecretAny(v, &secret); err != nil {
 						return err
 					}
 
@@ -257,7 +300,7 @@ func (s *Keeper) reencryptAllWithKey(newKey, oldKey []byte) error {
 					}
 					secret.Ciphertext = ct
 
-					if secret.SchemaVersion == secretSchemaV1 && len(secret.EncryptedMeta) > 0 {
+					if secret.SchemaVersion >= secretSchemaV1 && len(secret.EncryptedMeta) > 0 {
 						oldMetaKey, merr := s.deriveMetaKey(oldKey)
 						if merr != nil {
 							return fmt.Errorf("derive old meta key: %w", merr)
@@ -281,7 +324,7 @@ func (s *Keeper) reencryptAllWithKey(newKey, oldKey []byte) error {
 						secret.Version++
 					}
 
-					data, err := json.Marshal(secret)
+					data, err := marshalSecret(&secret)
 					if err != nil {
 						return err
 					}
@@ -525,11 +568,11 @@ func (s *Keeper) incrementAccessCount(scheme, namespace, key string) {
 			return nil
 		}
 		var secret Secret
-		if err := json.Unmarshal(data, &secret); err != nil {
+		if err := unmarshalSecret(data, &secret); err != nil {
 			return err
 		}
 
-		if secret.SchemaVersion == secretSchemaV1 && len(secret.EncryptedMeta) > 0 {
+		if secret.SchemaVersion >= secretSchemaV1 && len(secret.EncryptedMeta) > 0 {
 			bucketDEK, err := s.bucketKeyBytes(scheme, namespace)
 			if err != nil {
 				return nil
@@ -551,7 +594,7 @@ func (s *Keeper) incrementAccessCount(scheme, namespace, key string) {
 			secret.LastAccess = time.Now()
 		}
 
-		newData, err := json.Marshal(secret)
+		newData, err := marshalSecret(&secret)
 		if err != nil {
 			return err
 		}
@@ -593,7 +636,7 @@ func (s *Keeper) encryptMeta(meta *EncryptedMetadata, bucketDEK []byte) ([]byte,
 }
 
 func (s *Keeper) encryptMetaWithKey(meta *EncryptedMetadata, metaKey []byte) ([]byte, error) {
-	plain, err := json.Marshal(meta)
+	plain, err := marshalEncryptedMetadata(meta)
 	if err != nil {
 		return nil, err
 	}
@@ -617,7 +660,7 @@ func (s *Keeper) decryptMetaWithKey(data, metaKey []byte) (*EncryptedMetadata, e
 		return nil, fmt.Errorf("%w: %v", ErrMetadataDecrypt, err)
 	}
 	var meta EncryptedMetadata
-	if err := json.Unmarshal(plain, &meta); err != nil {
+	if err := unmarshalEncryptedMetadata(plain, &meta); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrMetadataDecrypt, err)
 	}
 	return &meta, nil
@@ -691,7 +734,7 @@ func (s *Keeper) migrateBatch() (bool, error) {
 						return nil
 					}
 					var secret Secret
-					if err := json.Unmarshal(v, &secret); err != nil {
+					if err := unmarshalSecretAny(v, &secret); err != nil {
 						return nil
 					}
 					if secret.SchemaVersion != secretSchemaV0 {
@@ -717,9 +760,9 @@ func (s *Keeper) migrateBatch() (bool, error) {
 					newSecret := Secret{
 						Ciphertext:    secret.Ciphertext,
 						EncryptedMeta: em,
-						SchemaVersion: secretSchemaV1,
+						SchemaVersion: secretSchemaV2,
 					}
-					data, err := json.Marshal(newSecret)
+					data, err := marshalSecret(&newSecret)
 					if err != nil {
 						return nil
 					}
@@ -784,7 +827,7 @@ func (s *Keeper) storeMigrationCursorTx(tx pkgstore.Tx, cursor string) error {
 }
 
 func (s *Keeper) markMigrationDone() error {
-	return s.db.Update(func(tx pkgstore.Tx) error {
+	err := s.db.Update(func(tx pkgstore.Tx) error {
 		b := tx.Bucket([]byte(metaBucket))
 		if b == nil {
 			return nil
@@ -794,4 +837,8 @@ func (s *Keeper) markMigrationDone() error {
 		}
 		return b.Delete([]byte(migrationWALKey))
 	})
+	if err == nil {
+		s.logger.Info("metadata migration completed — all records are now schema V2")
+	}
+	return err
 }
