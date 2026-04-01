@@ -64,8 +64,6 @@ func (s *BoltStore) Close() error {
 	return s.db.Close()
 }
 
-// ── boltTx ────────────────────────────────────────────────────────────────
-
 type boltTx struct{ tx *bolt.Tx }
 
 var _ Tx = (*boltTx)(nil)
@@ -95,8 +93,6 @@ func (t *boltTx) ForEach(fn func(name []byte, b Bucket) error) error {
 		return fn(name, &boltBucket{b})
 	})
 }
-
-// ── boltBucket ────────────────────────────────────────────────────────────
 
 type boltBucket struct{ b *bolt.Bucket }
 
