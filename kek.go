@@ -8,6 +8,7 @@ import (
 	"io"
 
 	"github.com/awnumar/memguard"
+	"github.com/olekukonko/zero"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
 )
@@ -31,7 +32,7 @@ func DeriveKEK(masterKey, adminCred, salt []byte) ([]byte, error) {
 	ikm := make([]byte, len(masterKey)+len(adminCred))
 	copy(ikm, masterKey)
 	copy(ikm[len(masterKey):], adminCred)
-	defer secureZero(ikm)
+	defer zero.Bytes(ikm)
 
 	r := hkdf.New(sha256.New, ikm, salt, []byte(hkdfInfoKEK))
 	kek := make([]byte, chacha20poly1305.KeySize)
@@ -68,7 +69,7 @@ func GenerateDEK() (*memguard.Enclave, error) {
 // Format: [24-byte nonce][ciphertext+16-byte tag].
 // kek is zeroed after use.
 func WrapDEK(dek *memguard.Enclave, kek []byte) ([]byte, error) {
-	defer secureZero(kek)
+	defer zero.Bytes(kek)
 
 	aead, err := chacha20poly1305.NewX(kek)
 	if err != nil {
@@ -91,7 +92,7 @@ func WrapDEK(dek *memguard.Enclave, kek []byte) ([]byte, error) {
 // UnwrapDEK decrypts a wrapped DEK. Returns it sealed in a new Enclave.
 // kek is zeroed after use. Returns ErrInvalidPassphrase on authentication failure.
 func UnwrapDEK(wrapped, kek []byte) (*memguard.Enclave, error) {
-	defer secureZero(kek)
+	defer zero.Bytes(kek)
 
 	aead, err := chacha20poly1305.NewX(kek)
 	if err != nil {
@@ -105,7 +106,7 @@ func UnwrapDEK(wrapped, kek []byte) (*memguard.Enclave, error) {
 	if err != nil {
 		return nil, ErrInvalidPassphrase
 	}
-	defer secureZero(raw)
+	defer zero.Bytes(raw)
 
 	buf := memguard.NewBufferFromBytes(raw)
 	if buf.Size() == 0 {

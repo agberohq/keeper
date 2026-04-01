@@ -19,6 +19,7 @@ require (
 	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
 	github.com/olekukonko/cat v0.0.0-20250911104152-50322a0618f6 // indirect
+	github.com/olekukonko/zero v0.0.0-20260401163106-d916bce9a71d // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 )

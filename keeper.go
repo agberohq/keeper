@@ -16,6 +16,7 @@ import (
 	"github.com/awnumar/memguard"
 	jack "github.com/olekukonko/jack"
 	"github.com/olekukonko/ll"
+	"github.com/olekukonko/zero"
 )
 
 // Keeper is the encrypted secret store.
@@ -245,7 +246,7 @@ func (s *Keeper) CreateBucket(scheme, namespace string, level SecurityLevel, cre
 		dekBuf.Destroy()
 
 		wrapped, err := policy.HSMProvider.WrapDEK(dekBytes)
-		secureZero(dekBytes)
+		zero.Bytes(dekBytes)
 		if err != nil {
 			return fmt.Errorf("HSM wrap failed: %w", err)
 		}
@@ -310,7 +311,7 @@ func (s *Keeper) RegisterHSMProvider(scheme, namespace string, provider HSMProvi
 // AddAdminToPolicy wraps the bucket DEK under a new admin's KEK and persists
 // the updated policy.
 func (s *Keeper) AddAdminToPolicy(scheme, namespace, adminID string, adminPassword []byte) error {
-	defer secureZero(adminPassword)
+	defer zero.Bytes(adminPassword)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.locked {
@@ -327,7 +328,7 @@ func (s *Keeper) AddAdminToPolicy(scheme, namespace, adminID string, adminPasswo
 	if err != nil {
 		return err
 	}
-	defer secureZero(masterBytes)
+	defer zero.Bytes(masterBytes)
 
 	var dekEnc *memguard.Enclave
 	if len(policy.WrappedDEKs) == 0 {
@@ -405,7 +406,7 @@ func (s *Keeper) RevokeAdmin(scheme, namespace, adminID string) error {
 // UnlockBucket unlocks a LevelAdminWrapped bucket.
 // adminPassword is zeroed by this method.
 func (s *Keeper) UnlockBucket(scheme, namespace, adminID string, adminPassword []byte) error {
-	defer secureZero(adminPassword)
+	defer zero.Bytes(adminPassword)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.locked {
@@ -490,14 +491,14 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 		return fmt.Errorf("failed to read master key for audit derivation: %w", err)
 	}
 	auditKey, err := deriveAuditKey(masterBytes)
-	secureZero(masterBytes)
+	zero.Bytes(masterBytes)
 	if err != nil {
 		s.locked = true
 		s.master = nil
 		return fmt.Errorf("failed to derive audit signing key: %w", err)
 	}
 	s.auditStore.setSigningKey(auditKey)
-	secureZero(auditKey)
+	zero.Bytes(auditKey)
 
 	// Derive and activate the policy HMAC key.
 	masterBytes2, err := master.Bytes()
@@ -508,7 +509,7 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 		return fmt.Errorf("failed to read master key for policy key derivation: %w", err)
 	}
 	policyKey, err := derivePolicyKey(masterBytes2)
-	secureZero(masterBytes2)
+	zero.Bytes(masterBytes2)
 	if err != nil {
 		s.locked = true
 		s.master = nil
@@ -525,20 +526,20 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 			s.locked = true
 			s.master = nil
 			s.auditStore.setSigningKey(nil)
-			secureZero(s.policyKey)
+			zero.Bytes(s.policyKey)
 			s.policyKey = nil
 			return fmt.Errorf("failed to read master key for rotation resume: %w", rerr)
 		}
 		if rerr := s.resumeRotation(masterBytesForResume); rerr != nil {
-			secureZero(masterBytesForResume)
+			zero.Bytes(masterBytesForResume)
 			s.locked = true
 			s.master = nil
 			s.auditStore.setSigningKey(nil)
-			secureZero(s.policyKey)
+			zero.Bytes(s.policyKey)
 			s.policyKey = nil
 			return fmt.Errorf("failed to resume interrupted rotation: %w", rerr)
 		}
-		secureZero(masterBytesForResume)
+		zero.Bytes(masterBytesForResume)
 		s.logger.Info("interrupted rotation completed successfully")
 	}
 
@@ -728,7 +729,7 @@ func (s *Keeper) Lock() error {
 	}
 	s.envelope.DropAll()
 	s.auditStore.setSigningKey(nil)
-	secureZero(s.policyKey)
+	zero.Bytes(s.policyKey)
 	s.policyKey = nil
 	if s.master != nil {
 		s.master.Destroy()
@@ -948,7 +949,7 @@ func (s *Keeper) SetNamespacedFull(scheme, namespace, key string, value []byte) 
 		s.metrics.IncrementWriteError()
 		return err
 	}
-	defer secureZero(bucketDEK)
+	defer zero.Bytes(bucketDEK)
 
 	// Carry forward creation time and access count from the existing record.
 	now := time.Now()
@@ -1098,7 +1099,7 @@ func (s *Keeper) CompareAndSwapNamespacedFull(scheme, namespace, key string, old
 		if err != nil {
 			return err
 		}
-		defer secureZero(casKey)
+		defer zero.Bytes(casKey)
 
 		b, err := s.createNamespaceBucket(tx, scheme, namespace)
 		if err != nil {
@@ -1117,10 +1118,10 @@ func (s *Keeper) CompareAndSwapNamespacedFull(scheme, namespace, key string, old
 			return fmt.Errorf("decryption failed: %w", err)
 		}
 		if !bytes.Equal(cur, oldValue) {
-			secureZero(cur)
+			zero.Bytes(cur)
 			return ErrCASConflict
 		}
-		secureZero(cur)
+		zero.Bytes(cur)
 
 		ct, err := s.encryptWithKey(newValue, casKey)
 		if err != nil {
@@ -1138,7 +1139,7 @@ func (s *Keeper) CompareAndSwapNamespacedFull(scheme, namespace, key string, old
 						secret.EncryptedMeta = em
 					}
 				}
-				secureZero(metaKey)
+				zero.Bytes(metaKey)
 			}
 		}
 
@@ -1433,7 +1434,7 @@ func (s *Keeper) Stats() (*StoreStats, error) {
 				bucketDEK, _ := s.bucketKeyBytes(sn, ns)
 				defer func() {
 					if bucketDEK != nil {
-						secureZero(bucketDEK)
+						zero.Bytes(bucketDEK)
 					}
 				}()
 

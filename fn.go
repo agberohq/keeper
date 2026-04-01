@@ -67,12 +67,6 @@ func bucketName(namespace string) []byte {
 	return []byte(namespace)
 }
 
-func secureZero(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
-}
-
 // isPolicyHashKey reports whether a policy bucket key is a metadata entry
 // (:hash or :hmac suffix) that should be skipped during policy iteration.
 func isPolicyHashKey(key string) bool {

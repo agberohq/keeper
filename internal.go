@@ -17,6 +17,7 @@ import (
 	pkgstore "github.com/agberohq/keeper/pkg/store"
 	"github.com/awnumar/memguard"
 	"github.com/olekukonko/errors"
+	"github.com/olekukonko/zero"
 	msgpack "github.com/vmihailenco/msgpack/v5"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/hkdf"
@@ -150,8 +151,8 @@ func (s *Keeper) unlockBucketAdminWrapped(scheme, namespace, adminID string, adm
 	// Deep copy before zeroing — slice assignment aliases the backing array.
 	mbCopy := make([]byte, len(masterBytes))
 	copy(mbCopy, masterBytes)
-	secureZero(masterBytes)
-	defer secureZero(mbCopy)
+	zero.Bytes(masterBytes)
+	defer zero.Bytes(mbCopy)
 
 	kek, err := DeriveKEK(mbCopy, adminPassword, policy.DEKSalt)
 	if err != nil {
@@ -221,7 +222,7 @@ func (s *Keeper) encrypt(plaintext []byte, scheme, namespace string) ([]byte, er
 	if err != nil {
 		return nil, err
 	}
-	defer secureZero(key)
+	defer zero.Bytes(key)
 	return s.encryptWithKey(plaintext, key)
 }
 
@@ -230,7 +231,7 @@ func (s *Keeper) decrypt(ciphertext []byte, scheme, namespace string) ([]byte, e
 	if err != nil {
 		return nil, err
 	}
-	defer secureZero(key)
+	defer zero.Bytes(key)
 	return s.decryptWithKey(ciphertext, key)
 }
 
@@ -312,7 +313,7 @@ func (s *Keeper) resumeRotation(masterKey []byte) error {
 	if err != nil {
 		return fmt.Errorf("failed to unwrap old key from rotation WAL: %w", err)
 	}
-	defer secureZero(oldKey)
+	defer zero.Bytes(oldKey)
 
 	s.logger.Fields("cursor", wal.LastKey).Info("resuming interrupted key rotation")
 	if err := s.encryptAllRecords(masterKey, oldKey, wal); err != nil {
@@ -427,7 +428,7 @@ func (s *Keeper) reencryptRecord(scheme, namespace, key string, newKey, oldKey [
 			return fmt.Errorf("decrypt %s: %w", key, err)
 		}
 		ct, err := s.encryptWithKey(pt, newKey)
-		secureZero(pt)
+		zero.Bytes(pt)
 		if err != nil {
 			return fmt.Errorf("encrypt %s: %w", key, err)
 		}
@@ -439,7 +440,7 @@ func (s *Keeper) reencryptRecord(scheme, namespace, key string, newKey, oldKey [
 				return fmt.Errorf("derive old meta key: %w", merr)
 			}
 			meta, merr := s.decryptMetaWithKey(secret.EncryptedMeta, oldMetaKey)
-			secureZero(oldMetaKey)
+			zero.Bytes(oldMetaKey)
 			if merr != nil {
 				return fmt.Errorf("decrypt meta %s: %w", key, merr)
 			}
@@ -448,7 +449,7 @@ func (s *Keeper) reencryptRecord(scheme, namespace, key string, newKey, oldKey [
 				return fmt.Errorf("derive new meta key: %w", merr)
 			}
 			newEM, merr := s.encryptMetaWithKey(meta, newMetaKey)
-			secureZero(newMetaKey)
+			zero.Bytes(newMetaKey)
 			if merr != nil {
 				return fmt.Errorf("encrypt meta %s: %w", key, merr)
 			}
@@ -927,7 +928,7 @@ func (s *Keeper) incrementAccessCount(scheme, namespace, key string) {
 			if err != nil {
 				return nil
 			}
-			defer secureZero(bucketDEK)
+			defer zero.Bytes(bucketDEK)
 			meta, err := s.decryptMeta(secret.EncryptedMeta, bucketDEK)
 			if err != nil {
 				return nil
@@ -986,7 +987,7 @@ func (s *Keeper) newEncHealthCheck() func(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("enc health: cannot retrieve DEK: %w", err)
 		}
-		defer secureZero(key)
+		defer zero.Bytes(key)
 		ct, err := s.encryptWithKey(encHealthTestVector, key)
 		if err != nil {
 			return fmt.Errorf("enc health: encryption failed: %w", err)
@@ -1018,7 +1019,7 @@ func (s *Keeper) encryptMeta(meta *EncryptedMetadata, bucketDEK []byte) ([]byte,
 	if err != nil {
 		return nil, err
 	}
-	defer secureZero(metaKey)
+	defer zero.Bytes(metaKey)
 	return s.encryptMetaWithKey(meta, metaKey)
 }
 
@@ -1028,7 +1029,7 @@ func (s *Keeper) encryptMetaWithKey(meta *EncryptedMetadata, metaKey []byte) ([]
 		return nil, err
 	}
 	ct, err := s.encryptWithKey(plain, metaKey)
-	secureZero(plain)
+	zero.Bytes(plain)
 	return ct, err
 }
 
@@ -1037,7 +1038,7 @@ func (s *Keeper) decryptMeta(data, bucketDEK []byte) (*EncryptedMetadata, error)
 	if err != nil {
 		return nil, err
 	}
-	defer secureZero(metaKey)
+	defer zero.Bytes(metaKey)
 	return s.decryptMetaWithKey(data, metaKey)
 }
 

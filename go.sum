@@ -18,6 +18,10 @@ github.com/olekukonko/jack v0.0.0-20260315063850-82b24943796a h1:DqC2t+hBhPncUgU
 github.com/olekukonko/jack v0.0.0-20260315063850-82b24943796a/go.mod h1:DO5wvYWCkIkvvqssDZv8f2x6aMBAu9lIjMXBDQW8R3c=
 github.com/olekukonko/ll v0.1.8 h1:ysHCJRGHYKzmBSdz9w5AySztx7lG8SQY+naTGYUbsz8=
 github.com/olekukonko/ll v0.1.8/go.mod h1:RPRC6UcscfFZgjo1nulkfMH5IM0QAYim0LfnMvUuozw=
+github.com/olekukonko/zero v0.0.0-20260401114156-22257ebad792 h1:PRB1BDYEfHJHbXiToCtjzXUiODx+Og9XyoovlFl0KB8=
+github.com/olekukonko/zero v0.0.0-20260401114156-22257ebad792/go.mod h1:CBcteL2IEe74NgTKejfQvFB537bV8we9eMudmUhL8v4=
+github.com/olekukonko/zero v0.0.0-20260401163106-d916bce9a71d h1:W62gtMPZNVR/nn9zpGMXBjArwmU++KG+o/S9oMqI7Hc=
+github.com/olekukonko/zero v0.0.0-20260401163106-d916bce9a71d/go.mod h1:CBcteL2IEe74NgTKejfQvFB537bV8we9eMudmUhL8v4=
 github.com/pborman/getopt v0.0.0-20170112200414-7148bc3a4c30/go.mod h1:85jBQOZwpVEaDAr341tbn15RS4fCAsIst0qp7i8ex1o=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=

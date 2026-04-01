@@ -6,6 +6,7 @@ import (
 	"time"
 
 	pkgaudit "github.com/agberohq/keeper/pkg/audit"
+	"github.com/olekukonko/zero"
 )
 
 // Unlock derives a Master key from passphrase bytes and calls UnlockDatabase.
@@ -43,7 +44,7 @@ func (s *Keeper) RotateSalt(passphrase []byte) error {
 	if err != nil {
 		return fmt.Errorf("failed to read current master key: %w", err)
 	}
-	defer secureZero(oldKey)
+	defer zero.Bytes(oldKey)
 
 	newSalt, _, err := s.rotateSalt()
 	if err != nil {
@@ -54,7 +55,7 @@ func (s *Keeper) RotateSalt(passphrase []byte) error {
 	if err != nil {
 		return fmt.Errorf("key derivation with new salt failed: %w", err)
 	}
-	defer secureZero(newKey)
+	defer zero.Bytes(newKey)
 
 	if err := s.reencryptAllWithKey(newKey, oldKey); err != nil {
 		return fmt.Errorf("re-encryption failed: %w", err)
@@ -74,23 +75,23 @@ func (s *Keeper) RotateSalt(passphrase []byte) error {
 	}
 	newAuditKey, err := deriveAuditKey(newKey)
 	if err != nil {
-		secureZero(oldAuditKey)
+		zero.Bytes(oldAuditKey)
 		return fmt.Errorf("failed to derive new audit key: %w", err)
 	}
 
 	s.appendRotationCheckpoints(oldAuditKey, newAuditKey)
-	secureZero(oldAuditKey)
+	zero.Bytes(oldAuditKey)
 
 	s.master.Destroy()
 	s.master = newMaster
 	s.auditStore.setSigningKey(newAuditKey)
-	secureZero(newAuditKey)
+	zero.Bytes(newAuditKey)
 
 	newPolicyKey, err := derivePolicyKey(newKey)
 	if err != nil {
 		return fmt.Errorf("failed to derive new policy key: %w", err)
 	}
-	secureZero(s.policyKey)
+	zero.Bytes(s.policyKey)
 	s.policyKey = newPolicyKey
 	if err := s.upgradePolicyHMACs(); err != nil {
 		s.logger.Fields("err", err).Warn("policy HMAC rewrite after salt rotation failed — continuing")
@@ -150,7 +151,7 @@ func (s *Keeper) NeedsAdminRekey(scheme, namespace string) (bool, error) {
 // admins whose credentials were supplied here will have up-to-date wrapped copies.
 // Other admins must call this method with their own credentials to update their copy.
 func (s *Keeper) RotateAdminWrappedDEK(scheme, namespace, adminID string, adminPassword []byte) error {
-	defer secureZero(adminPassword)
+	defer zero.Bytes(adminPassword)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.locked {
@@ -173,7 +174,7 @@ func (s *Keeper) RotateAdminWrappedDEK(scheme, namespace, adminID string, adminP
 	if err != nil {
 		return fmt.Errorf("failed to read master key: %w", err)
 	}
-	defer secureZero(masterBytes)
+	defer zero.Bytes(masterBytes)
 
 	existingKEK, err := DeriveKEK(masterBytes, adminPassword, policy.DEKSalt)
 	if err != nil {
@@ -190,7 +191,7 @@ func (s *Keeper) RotateAdminWrappedDEK(scheme, namespace, adminID string, adminP
 	dekBytes := make([]byte, dekBuf.Size())
 	copy(dekBytes, dekBuf.Bytes())
 	dekBuf.Destroy()
-	defer secureZero(dekBytes)
+	defer zero.Bytes(dekBytes)
 
 	// Generate a fresh per-bucket DEK salt.
 	newSalt, err := GenerateDEKSalt()
@@ -205,12 +206,12 @@ func (s *Keeper) RotateAdminWrappedDEK(scheme, namespace, adminID string, adminP
 	}
 	newDEKEnc, err := NewMaster(dekBytes) // reuse memguard sealing pattern
 	if err != nil {
-		secureZero(newKEK)
+		zero.Bytes(newKEK)
 		return fmt.Errorf("failed to seal DEK for re-wrap: %w", err)
 	}
 	dekEncForWrap, oerr := newDEKEnc.Open()
 	if oerr != nil {
-		secureZero(newKEK)
+		zero.Bytes(newKEK)
 		return fmt.Errorf("failed to open sealed DEK: %w", oerr)
 	}
 	reWrapped, wErr := WrapDEK(dekEncForWrap.Seal(), newKEK) // newKEK zeroed inside WrapDEK
@@ -254,7 +255,7 @@ func (s *Keeper) Rotate(newPassphrase []byte) error {
 	if err != nil {
 		return fmt.Errorf("failed to read current master key: %w", err)
 	}
-	defer secureZero(oldKey)
+	defer zero.Bytes(oldKey)
 
 	salt, err := s.getOrCreateSalt()
 	if err != nil {
@@ -264,7 +265,7 @@ func (s *Keeper) Rotate(newPassphrase []byte) error {
 	if err != nil {
 		return fmt.Errorf("key derivation failed: %w", err)
 	}
-	defer secureZero(newKey)
+	defer zero.Bytes(newKey)
 
 	if err := s.reencryptAllWithKey(newKey, oldKey); err != nil {
 		return fmt.Errorf("re-encryption failed: %w", err)
@@ -286,7 +287,7 @@ func (s *Keeper) Rotate(newPassphrase []byte) error {
 	}
 	newAuditKey, err := deriveAuditKey(newKey)
 	if err != nil {
-		secureZero(oldAuditKey)
+		zero.Bytes(oldAuditKey)
 		return fmt.Errorf("failed to derive new audit key: %w", err)
 	}
 
@@ -294,13 +295,13 @@ func (s *Keeper) Rotate(newPassphrase []byte) error {
 	// This is O(number of chains) — one small event per chain regardless of
 	// how many events are in the chain.
 	s.appendRotationCheckpoints(oldAuditKey, newAuditKey)
-	secureZero(oldAuditKey)
+	zero.Bytes(oldAuditKey)
 
 	// Swap the master and activate the new audit signing key.
 	s.master.Destroy()
 	s.master = newMaster
 	s.auditStore.setSigningKey(newAuditKey)
-	secureZero(newAuditKey)
+	zero.Bytes(newAuditKey)
 
 	// Re-derive the policy HMAC key from the new master and rewrite all
 	// policy records with the new tag.
@@ -308,7 +309,7 @@ func (s *Keeper) Rotate(newPassphrase []byte) error {
 	if err != nil {
 		return fmt.Errorf("failed to derive new policy key: %w", err)
 	}
-	secureZero(s.policyKey)
+	zero.Bytes(s.policyKey)
 	s.policyKey = newPolicyKey
 	if err := s.upgradePolicyHMACs(); err != nil {
 		s.logger.Fields("err", err).Warn("policy HMAC rewrite after rotation failed — continuing")

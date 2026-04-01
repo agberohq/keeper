@@ -588,7 +588,7 @@ predates the current master salt generation.
 ### Slice copy before secureZero
 
 `mbCopy := make([]byte, len(masterBytes)); copy(mbCopy, masterBytes)` is used
-before `secureZero(masterBytes)` throughout. A plain assignment aliases the
+before `zero.Bytes(masterBytes)` throughout. A plain assignment aliases the
 backing array; zeroing it would corrupt a concurrent reader. The copy gives
 each caller exclusive ownership of its byte slice.
 

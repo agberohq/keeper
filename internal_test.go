@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/agberohq/keeper/pkg/crypt"
+	"github.com/olekukonko/zero"
 )
 
 func TestIsBucketUnlocked_DefaultBucket(t *testing.T) {
@@ -182,7 +183,7 @@ func TestBucketKey_DefaultUsesMaster(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bucketKeyBytes: %v", err)
 	}
-	defer secureZero(key)
+	defer zero.Bytes(key)
 	if len(key) == 0 {
 		t.Error("bucket key must be non-empty")
 	}
@@ -209,7 +210,7 @@ func TestBucketKey_ExplicitKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bucketKeyBytes: %v", err)
 	}
-	defer secureZero(key)
+	defer zero.Bytes(key)
 	if !bytes.Equal(key, expected) {
 		t.Errorf("expected explicit key, got different value")
 	}
