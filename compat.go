@@ -18,6 +18,93 @@ func (s *Keeper) Unlock(passphrase []byte) error {
 	return s.UnlockDatabase(master)
 }
 
+// RotateSalt generates a new KDF salt, re-derives the master key under it,
+// re-encrypts all LevelPasswordOnly secrets, and updates the verification
+// hash. The old salt is retained in the versioned salt store for audit
+// purposes.
+//
+// Salt rotation is independent of passphrase rotation. Call this periodically
+// or whenever you want to ensure that a compromised salt cannot be used to
+// accelerate offline attacks against a future passphrase breach.
+//
+// passphrase must be the current passphrase — it is used to re-derive the
+// master key under the new salt. It is NOT zeroed by this method.
+func (s *Keeper) RotateSalt(passphrase []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.locked {
+		return ErrStoreLocked
+	}
+
+	oldKey, err := s.master.Bytes()
+	if err != nil {
+		return fmt.Errorf("failed to read current master key: %w", err)
+	}
+	defer secureZero(oldKey)
+
+	newSalt, _, err := s.rotateSalt()
+	if err != nil {
+		return fmt.Errorf("failed to rotate salt: %w", err)
+	}
+
+	newKey, err := s.config.KDF.DeriveKey(passphrase, newSalt, s.config.KeyLen)
+	if err != nil {
+		return fmt.Errorf("key derivation with new salt failed: %w", err)
+	}
+	defer secureZero(newKey)
+
+	if err := s.reencryptAllWithKey(newKey, oldKey); err != nil {
+		return fmt.Errorf("re-encryption failed: %w", err)
+	}
+	if err := s.storeVerificationHash(newKey); err != nil {
+		return fmt.Errorf("failed to store verification hash: %w", err)
+	}
+
+	newMaster, err := NewMaster(newKey)
+	if err != nil {
+		return fmt.Errorf("failed to create new master: %w", err)
+	}
+
+	oldAuditKey, err := deriveAuditKey(oldKey)
+	if err != nil {
+		return fmt.Errorf("failed to derive old audit key: %w", err)
+	}
+	newAuditKey, err := deriveAuditKey(newKey)
+	if err != nil {
+		secureZero(oldAuditKey)
+		return fmt.Errorf("failed to derive new audit key: %w", err)
+	}
+
+	s.appendRotationCheckpoints(oldAuditKey, newAuditKey)
+	secureZero(oldAuditKey)
+
+	s.master.Destroy()
+	s.master = newMaster
+	s.auditStore.setSigningKey(newAuditKey)
+	secureZero(newAuditKey)
+
+	newPolicyKey, err := derivePolicyKey(newKey)
+	if err != nil {
+		return fmt.Errorf("failed to derive new policy key: %w", err)
+	}
+	secureZero(s.policyKey)
+	s.policyKey = newPolicyKey
+	if err := s.upgradePolicyHMACs(); err != nil {
+		s.logger.Fields("err", err).Warn("policy HMAC rewrite after salt rotation failed — continuing")
+	}
+
+	for _, policy := range s.schemeRegistry {
+		if policy.Level == LevelPasswordOnly {
+			if err := s.unlockBucketPasswordOnly(policy.Scheme, policy.Namespace); err != nil {
+				s.audit("salt_rotate_reseed_failed", policy.Scheme, policy.Namespace, "", false, 0)
+			}
+		}
+	}
+	_ = s.unlockBucketPasswordOnly(s.defaultScheme, s.defaultNs)
+	s.logger.Info("salt rotation completed")
+	return nil
+}
+
 // Rotate re-derives the master key with a new passphrase and re-encrypts every
 // LevelPasswordOnly secret. LevelAdminWrapped secrets use per-admin KEKs and
 // are unaffected.

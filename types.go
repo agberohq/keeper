@@ -100,8 +100,8 @@ type Config struct {
 	VerifyArgon2Parallelism uint8
 }
 
-// Secret is the on-disk record for a single key.
-// All records are encoded with msgpack. SchemaVersion is always 1.
+// Secret is the on-disk record for a single key, encoded with msgpack.
+// SchemaVersion is always currentSchemaVersion.
 type Secret struct {
 	Ciphertext    []byte `msgpack:"ct"`
 	EncryptedMeta []byte `msgpack:"em,omitempty"`
@@ -118,16 +118,36 @@ type EncryptedMetadata struct {
 	Version     int       `msgpack:"v"`
 }
 
+// SaltEntry records one generation of the KDF salt.
+type SaltEntry struct {
+	Version   int       `json:"v"`
+	Salt      []byte    `json:"s"`
+	CreatedAt time.Time `json:"ca"`
+}
+
+// SaltStore is the versioned salt container stored under metaSaltKey.
+// CurrentVersion indexes into Entries. Old entries are retained as an
+// audit trail and for crash-recovery during salt rotation.
+type SaltStore struct {
+	CurrentVersion int         `json:"current"`
+	Entries        []SaltEntry `json:"entries"`
+}
+
 // RotationWAL tracks the state of an in-progress key rotation.
-// Written to the metadata bucket before rotation begins. On crash, New()
-// reads this record and calls resumeRotation before opening the store.
+// Written atomically before the first record is re-encrypted.
+// On crash, UnlockDatabase reads this record and resumes automatically.
+//
+// WrappedOldKey is the pre-rotation master key encrypted with the new master
+// key using XChaCha20-Poly1305. It is the only safe way to carry the old
+// key across a crash boundary without storing it in plaintext.
 type RotationWAL struct {
-	Status      string    `json:"status"`
-	OldKeyHash  []byte    `json:"old_hash"`
-	NewKeyHash  []byte    `json:"new_hash"`
-	StartedAt   time.Time `json:"started"`
-	LastKey     string    `json:"last_key"` // cursor: scheme:namespace:key of last completed record
-	SaltVersion int       `json:"salt_ver"`
+	Status        string    `json:"status"`
+	OldKeyHash    []byte    `json:"old_hash"`
+	NewKeyHash    []byte    `json:"new_hash"`
+	StartedAt     time.Time `json:"started"`
+	LastKey       string    `json:"last_key"`
+	SaltVersion   int       `json:"salt_ver"`
+	WrappedOldKey []byte    `json:"wrapped_old_key"`
 }
 
 // NamespaceStats holds aggregate statistics for one namespace.
@@ -168,6 +188,7 @@ type StoreStats struct {
 	DBSize            int64         `json:"db_size_bytes"`
 	StorageEfficiency float64       `json:"storage_efficiency"`
 	KeyDerivation     string        `json:"key_derivation"`
+	SaltVersion       int           `json:"salt_version"`
 }
 
 // currentSchemaVersion is the schema version written by all new records.

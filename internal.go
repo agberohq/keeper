@@ -225,26 +225,33 @@ func (s *Keeper) updateActivity() {
 	atomic.StoreInt64(&s.lastActivity, time.Now().UnixNano())
 }
 
-// reencryptAllWithKey re-encrypts every LevelPasswordOnly secret and its
-// metadata from oldKey to newKey.
+// Crash-safe key rotation.
 //
-// Crash safety: the WAL records status and a cursor (scheme:namespace:key of
-// the last successfully written record). Each record is committed in its own
-// bbolt.Update, which is atomic. On crash, New() reads the WAL and calls
-// resumeRotation to complete from the cursor.
+// reencryptAllWithKey writes a WAL before touching any record. The WAL stores:
+//   - A cursor (LastKey) advanced after each record, so interrupted rotations
+//     can resume without re-processing completed records.
+//   - WrappedOldKey: the pre-rotation master key encrypted with the new master
+//     key. This is the only safe way to carry the old key across a crash
+//     boundary; without it, undone records cannot be decrypted at resume time
+//     because the old passphrase is gone.
 func (s *Keeper) reencryptAllWithKey(newKey, oldKey []byte) error {
 	if len(oldKey) == 0 {
 		return errors.New("old key is empty")
 	}
 
-	// Write WAL before touching any record.
+	wrappedOldKey, err := s.encryptWithKey(oldKey, newKey)
+	if err != nil {
+		return fmt.Errorf("failed to wrap old key for WAL: %w", err)
+	}
+
 	oldHash := sha256.Sum256(oldKey)
 	newHash := sha256.Sum256(newKey)
 	wal := &RotationWAL{
-		Status:     walStatusInProgress,
-		OldKeyHash: oldHash[:],
-		NewKeyHash: newHash[:],
-		StartedAt:  time.Now(),
+		Status:        walStatusInProgress,
+		OldKeyHash:    oldHash[:],
+		NewKeyHash:    newHash[:],
+		StartedAt:     time.Now(),
+		WrappedOldKey: wrappedOldKey,
 	}
 	if err := s.writeRotationWAL(wal); err != nil {
 		return fmt.Errorf("failed to write rotation WAL: %w", err)
@@ -258,8 +265,38 @@ func (s *Keeper) reencryptAllWithKey(newKey, oldKey []byte) error {
 	return s.clearRotationWAL()
 }
 
+// resumeRotation continues an interrupted rotation automatically.
+// Called from UnlockDatabase when a WAL is present.
+// masterKey is the new master key (already verified by UnlockDatabase).
+func (s *Keeper) resumeRotation(masterKey []byte) error {
+	wal, err := s.readRotationWAL()
+	if err != nil {
+		return fmt.Errorf("failed to read rotation WAL: %w", err)
+	}
+
+	// Verify this is the right key for this WAL.
+	gotHash := sha256.Sum256(masterKey)
+	if subtle.ConstantTimeCompare(gotHash[:], wal.NewKeyHash) != 1 {
+		return fmt.Errorf("master key does not match rotation WAL — wrong passphrase or corrupt WAL")
+	}
+
+	// Unwrap the old key from the WAL.
+	oldKey, err := s.decryptWithKey(wal.WrappedOldKey, masterKey)
+	if err != nil {
+		return fmt.Errorf("failed to unwrap old key from rotation WAL: %w", err)
+	}
+	defer secureZero(oldKey)
+
+	s.logger.Fields("cursor", wal.LastKey).Info("resuming interrupted key rotation")
+	if err := s.encryptAllRecords(masterKey, oldKey, wal); err != nil {
+		return fmt.Errorf("re-encryption resume failed: %w", err)
+	}
+	return s.clearRotationWAL()
+}
+
 // encryptAllRecords iterates every secret bucket and re-encrypts each record
-// individually. The WAL cursor is updated after each successful record write.
+// individually. Each record is committed in its own atomic bbolt.Update.
+// The WAL cursor is updated after each successful write.
 func (s *Keeper) encryptAllRecords(newKey, oldKey []byte, wal *RotationWAL) error {
 	var schemes []string
 	if err := s.db.View(func(tx pkgstore.Tx) error {
@@ -310,16 +347,15 @@ func (s *Keeper) encryptAllRecords(newKey, oldKey []byte, wal *RotationWAL) erro
 
 			for _, key := range keys {
 				cursor := schemeName + ":" + nsName + ":" + key
-				// Skip records already processed before a crash.
 				if wal.LastKey != "" && cursor <= wal.LastKey {
-					continue
+					continue // already completed before crash
 				}
 				if err := s.reencryptRecord(schemeName, nsName, key, newKey, oldKey); err != nil {
 					return err
 				}
 				wal.LastKey = cursor
 				if err := s.writeRotationWAL(wal); err != nil {
-					return fmt.Errorf("failed to update rotation WAL cursor: %w", err)
+					return fmt.Errorf("failed to advance rotation WAL cursor: %w", err)
 				}
 			}
 		}
@@ -327,7 +363,7 @@ func (s *Keeper) encryptAllRecords(newKey, oldKey []byte, wal *RotationWAL) erro
 	return nil
 }
 
-// reencryptRecord re-encrypts a single secret record in one atomic Update.
+// reencryptRecord re-encrypts a single secret in one atomic bbolt.Update.
 func (s *Keeper) reencryptRecord(scheme, namespace, key string, newKey, oldKey []byte) error {
 	return s.db.Update(func(tx pkgstore.Tx) error {
 		nb := s.getNamespaceBucket(tx, scheme, namespace)
@@ -383,20 +419,6 @@ func (s *Keeper) reencryptRecord(scheme, namespace, key string, newKey, oldKey [
 	})
 }
 
-// resumeRotation continues a rotation that was interrupted by a crash.
-// Called from New() when hasIncompleteRotation() returns true.
-func (s *Keeper) resumeRotation(newKey, oldKey []byte) error {
-	wal, err := s.readRotationWAL()
-	if err != nil {
-		return fmt.Errorf("failed to read rotation WAL: %w", err)
-	}
-	s.logger.Fields("cursor", wal.LastKey).Info("resuming interrupted key rotation")
-	if err := s.encryptAllRecords(newKey, oldKey, wal); err != nil {
-		return fmt.Errorf("re-encryption resume failed: %w", err)
-	}
-	return s.clearRotationWAL()
-}
-
 func (s *Keeper) writeRotationWAL(wal *RotationWAL) error {
 	data, err := json.Marshal(wal)
 	if err != nil {
@@ -450,38 +472,140 @@ func (s *Keeper) hasIncompleteRotation() bool {
 	return found
 }
 
+// Versioned salt storage.
+//
+// The salt is stored as a JSON-encoded SaltStore under metaSaltKey.
+// Each call to getOrCreateSalt returns the bytes of the current (highest
+// version) salt entry. Callers never see the versioning structure; they
+// receive and return raw salt bytes exactly as before.
+
 func (s *Keeper) getOrCreateSalt() ([]byte, error) {
-	var salt []byte
+	store, err := s.loadSaltStore()
+	if err != nil {
+		return nil, err
+	}
+	if store != nil && len(store.Entries) > 0 {
+		return store.currentSalt(), nil
+	}
+	// First run — generate salt and initialise the store.
+	salt := make([]byte, masterKeyLen)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, err
+	}
+	newStore := &SaltStore{
+		CurrentVersion: 1,
+		Entries: []SaltEntry{
+			{Version: 1, Salt: salt, CreatedAt: time.Now()},
+		},
+	}
+	return salt, s.saveSaltStore(newStore)
+}
+
+// currentSalt returns the bytes of the active salt entry.
+func (ss *SaltStore) currentSalt() []byte {
+	for _, e := range ss.Entries {
+		if e.Version == ss.CurrentVersion {
+			return e.Salt
+		}
+	}
+	// Fallback: highest version entry.
+	if len(ss.Entries) > 0 {
+		return ss.Entries[len(ss.Entries)-1].Salt
+	}
+	return nil
+}
+
+// saltVersion returns the current salt version number.
+func (ss *SaltStore) saltVersion() int {
+	return ss.CurrentVersion
+}
+
+// rotateSalt generates a new random salt and appends it to the store.
+// The old salt is retained for crash-recovery purposes.
+// Returns the new salt bytes and the new version number.
+func (s *Keeper) rotateSalt() ([]byte, int, error) {
+	store, err := s.loadSaltStore()
+	if err != nil {
+		return nil, 0, err
+	}
+	if store == nil {
+		store = &SaltStore{}
+	}
+	newSalt := make([]byte, masterKeyLen)
+	if _, err := rand.Read(newSalt); err != nil {
+		return nil, 0, err
+	}
+	newVersion := store.CurrentVersion + 1
+	store.Entries = append(store.Entries, SaltEntry{
+		Version:   newVersion,
+		Salt:      newSalt,
+		CreatedAt: time.Now(),
+	})
+	store.CurrentVersion = newVersion
+	return newSalt, newVersion, s.saveSaltStore(store)
+}
+
+func (s *Keeper) loadSaltStore() (*SaltStore, error) {
+	var raw []byte
 	if err := s.db.View(func(tx pkgstore.Tx) error {
 		b := tx.Bucket([]byte(metaBucket))
 		if b == nil {
 			return nil
 		}
 		if data := b.Get([]byte(metaSaltKey)); data != nil {
-			salt = append([]byte(nil), data...)
+			raw = append([]byte(nil), data...)
 		}
 		return nil
 	}); err != nil {
 		return nil, err
 	}
-	if salt != nil {
-		return salt, nil
+	if raw == nil {
+		return nil, nil
 	}
-	salt = make([]byte, masterKeyLen)
-	if _, err := rand.Read(salt); err != nil {
-		return nil, err
+	// Detect legacy format: a bare 32-byte salt stored as raw bytes.
+	// A JSON SaltStore always starts with '{'.
+	if len(raw) > 0 && raw[0] != '{' {
+		// Migrate: wrap the bare salt in a versioned store.
+		salt := append([]byte(nil), raw...)
+		store := &SaltStore{
+			CurrentVersion: 1,
+			Entries: []SaltEntry{
+				{Version: 1, Salt: salt, CreatedAt: time.Now()},
+			},
+		}
+		if err := s.saveSaltStore(store); err != nil {
+			return nil, fmt.Errorf("salt migration failed: %w", err)
+		}
+		return store, nil
 	}
-	return salt, s.storeSalt(salt)
+	var store SaltStore
+	if err := json.Unmarshal(raw, &store); err != nil {
+		return nil, fmt.Errorf("failed to decode salt store: %w", err)
+	}
+	return &store, nil
 }
 
-func (s *Keeper) storeSalt(salt []byte) error {
+func (s *Keeper) saveSaltStore(store *SaltStore) error {
+	data, err := json.Marshal(store)
+	if err != nil {
+		return err
+	}
 	return s.db.Update(func(tx pkgstore.Tx) error {
 		b := tx.Bucket([]byte(metaBucket))
 		if b == nil {
 			return stdErrors.New("metadata bucket not found")
 		}
-		return b.Put([]byte(metaSaltKey), salt)
+		return b.Put([]byte(metaSaltKey), data)
 	})
+}
+
+// currentSaltVersion returns the current salt version for use in Stats.
+func (s *Keeper) currentSaltVersion() int {
+	store, err := s.loadSaltStore()
+	if err != nil || store == nil {
+		return 0
+	}
+	return store.CurrentVersion
 }
 
 func (s *Keeper) storeVerificationHash(key []byte) error {
@@ -537,10 +661,9 @@ func (s *Keeper) verifyArgon2Params() (t, m uint32, p uint8) {
 	return
 }
 
-// Policy HMAC key helpers.
+// Policy HMAC helpers.
 
 // derivePolicyKey produces a 32-byte HMAC key for policy authentication.
-// Distinct info string from the audit key — each key has one purpose.
 func derivePolicyKey(masterBytes []byte) ([]byte, error) {
 	r := hkdf.New(sha256.New, masterBytes, nil, []byte(hkdfInfoPolicyHMAC))
 	key := make([]byte, masterKeyLen)
@@ -557,14 +680,16 @@ func computePolicyHMAC(policyKey, policyJSON []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// policyHashIntegrity returns SHA-256(policyJSON) as hex — used before unlock.
+// policyHashIntegrity returns SHA-256(policyJSON) as hex.
+// Used as an unauthenticated integrity check before the store is unlocked.
 func policyHashIntegrity(data []byte) string {
 	h := sha256.Sum256(data)
 	return hex.EncodeToString(h[:])
 }
 
-// savePolicy persists a policy with both the unauthenticated SHA-256 hash and,
-// when the store is unlocked (policyKey available), an authenticated HMAC tag.
+// savePolicy persists a policy with both a SHA-256 hash and, when the store
+// is unlocked (policyKey set), an authenticated HMAC tag. All three entries
+// are written in one atomic bbolt.Update — no partial state is possible.
 func (s *Keeper) savePolicy(policy *BucketSecurityPolicy) error {
 	return s.db.Update(func(tx pkgstore.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(policyBucket))
@@ -579,11 +704,9 @@ func (s *Keeper) savePolicy(policy *BucketSecurityPolicy) error {
 		if err := bucket.Put([]byte(key), data); err != nil {
 			return err
 		}
-		// Always write the unauthenticated hash for pre-unlock integrity checks.
 		if err := bucket.Put([]byte(key+policyHashSuffix), []byte(policyHashIntegrity(data))); err != nil {
 			return err
 		}
-		// Write the authenticated HMAC when the policy key is available.
 		if len(s.policyKey) > 0 {
 			tag := computePolicyHMAC(s.policyKey, data)
 			if err := bucket.Put([]byte(key+policyHMACSuffix), []byte(tag)); err != nil {
@@ -594,8 +717,8 @@ func (s *Keeper) savePolicy(policy *BucketSecurityPolicy) error {
 	})
 }
 
-// loadPolicies populates schemeRegistry at startup (before unlock).
-// Only SHA-256 hash verification is available at this stage.
+// loadPolicies populates schemeRegistry at startup before unlock.
+// Only the SHA-256 hash is verified at this stage.
 func (s *Keeper) loadPolicies() error {
 	return s.db.View(func(tx pkgstore.Tx) error {
 		policies := tx.Bucket([]byte(policyBucket))
@@ -618,8 +741,7 @@ func (s *Keeper) loadPolicies() error {
 }
 
 // loadPolicy returns the policy for scheme/namespace, verifying the HMAC when
-// the store is unlocked. Falls back to SHA-256 integrity check when no HMAC
-// tag is stored (e.g. policies created before this version).
+// the store is unlocked. Falls back to SHA-256 when no HMAC tag exists yet.
 func (s *Keeper) loadPolicy(scheme, namespace string) (*BucketSecurityPolicy, error) {
 	key := fmt.Sprintf("%s:%s", scheme, namespace)
 	if p, ok := s.schemeRegistry[key]; ok {
@@ -636,7 +758,6 @@ func (s *Keeper) loadPolicy(scheme, namespace string) (*BucketSecurityPolicy, er
 			return ErrPolicyNotFound
 		}
 
-		// Prefer HMAC verification when the store is unlocked and a tag exists.
 		if len(s.policyKey) > 0 {
 			if tag := policies.Get([]byte(key + policyHMACSuffix)); tag != nil {
 				expected := computePolicyHMAC(s.policyKey, data)
@@ -644,7 +765,7 @@ func (s *Keeper) loadPolicy(scheme, namespace string) (*BucketSecurityPolicy, er
 					return fmt.Errorf("%w: HMAC mismatch for policy %s", ErrPolicySignature, key)
 				}
 			} else {
-				// No HMAC tag yet — fall back to SHA-256 and upgrade on next save.
+				// No HMAC yet — fall back to SHA-256.
 				if storedHash := policies.Get([]byte(key + policyHashSuffix)); storedHash != nil {
 					if policyHashIntegrity(data) != string(storedHash) {
 						return fmt.Errorf("policy integrity check failed for %s", key)
@@ -652,7 +773,6 @@ func (s *Keeper) loadPolicy(scheme, namespace string) (*BucketSecurityPolicy, er
 				}
 			}
 		} else {
-			// Pre-unlock: SHA-256 only.
 			if storedHash := policies.Get([]byte(key + policyHashSuffix)); storedHash != nil {
 				if policyHashIntegrity(data) != string(storedHash) {
 					return fmt.Errorf("policy integrity check failed for %s", key)
@@ -669,9 +789,12 @@ func (s *Keeper) loadPolicy(scheme, namespace string) (*BucketSecurityPolicy, er
 	return &policy, nil
 }
 
-// upgradePolicyHMACs rewrites all policy records with an authenticated HMAC tag.
-// Called from UnlockDatabase after policyKey is set. Policies created before
-// this version only have a SHA-256 hash; this upgrades them in one pass.
+// upgradePolicyHMACs writes HMAC tags for any policy that has only a SHA-256
+// hash. Called from UnlockDatabase and Rotate after the policyKey is set.
+// Each policy's HMAC is written in the same transaction as its existing data,
+// so no partial state is possible within a single policy upgrade.
+// If the process crashes mid-upgrade, the next UnlockDatabase will re-run this
+// function and complete the remaining policies.
 func (s *Keeper) upgradePolicyHMACs() error {
 	if len(s.policyKey) == 0 {
 		return nil
@@ -681,29 +804,17 @@ func (s *Keeper) upgradePolicyHMACs() error {
 		if policies == nil {
 			return nil
 		}
-		var toUpgrade []struct{ key, data []byte }
-		_ = policies.ForEach(func(k, v []byte) error {
+		return policies.ForEach(func(k, v []byte) error {
 			key := string(k)
 			if isPolicyHashKey(key) {
 				return nil
 			}
-			// Only upgrade if no HMAC tag yet.
-			if policies.Get([]byte(key+policyHMACSuffix)) == nil {
-				kCopy := make([]byte, len(k))
-				copy(kCopy, k)
-				vCopy := make([]byte, len(v))
-				copy(vCopy, v)
-				toUpgrade = append(toUpgrade, struct{ key, data []byte }{kCopy, vCopy})
+			if policies.Get([]byte(key+policyHMACSuffix)) != nil {
+				return nil // already has HMAC tag
 			}
-			return nil
+			tag := computePolicyHMAC(s.policyKey, v)
+			return policies.Put([]byte(key+policyHMACSuffix), []byte(tag))
 		})
-		for _, item := range toUpgrade {
-			tag := computePolicyHMAC(s.policyKey, item.data)
-			if err := policies.Put(append(item.key, []byte(policyHMACSuffix)...), []byte(tag)); err != nil {
-				return err
-			}
-		}
-		return nil
 	})
 }
 

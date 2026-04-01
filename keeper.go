@@ -143,10 +143,6 @@ func New(config Config, opts ...func(*Config)) (*Keeper, error) {
 		db.Close()
 		return nil, fmt.Errorf("failed to load policies: %w", err)
 	}
-	if store.hasIncompleteRotation() {
-		db.Close()
-		return nil, ErrRotationIncomplete
-	}
 
 	// Register with Jack Shutdown when provided.
 	// Keeper's only registered callback is Lock — the pool lifecycle
@@ -439,6 +435,31 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 		return fmt.Errorf("failed to derive policy HMAC key: %w", err)
 	}
 	s.policyKey = policyKey
+
+	// If a rotation was interrupted by a crash, complete it now.
+	// The master key has been verified, so we know it is the new key.
+	if s.hasIncompleteRotation() {
+		masterBytesForResume, rerr := master.Bytes()
+		if rerr != nil {
+			s.locked = true
+			s.master = nil
+			s.auditStore.setSigningKey(nil)
+			secureZero(s.policyKey)
+			s.policyKey = nil
+			return fmt.Errorf("failed to read master key for rotation resume: %w", rerr)
+		}
+		if rerr := s.resumeRotation(masterBytesForResume); rerr != nil {
+			secureZero(masterBytesForResume)
+			s.locked = true
+			s.master = nil
+			s.auditStore.setSigningKey(nil)
+			secureZero(s.policyKey)
+			s.policyKey = nil
+			return fmt.Errorf("failed to resume interrupted rotation: %w", rerr)
+		}
+		secureZero(masterBytesForResume)
+		s.logger.Info("interrupted rotation completed successfully")
+	}
 
 	// Upgrade any policy records that only have a SHA-256 hash to HMAC tags.
 	if err := s.upgradePolicyHMACs(); err != nil {
@@ -1202,6 +1223,7 @@ func (s *Keeper) Stats() (*StoreStats, error) {
 		TotalWrites:      s.metrics.WritesTotal.Load(),
 		LastActivity:     lastActivity,
 		KeyDerivation:    keyDerivationLabel,
+		SaltVersion:      s.currentSaltVersion(),
 	}
 	if info, err := os.Stat(s.config.DBPath); err == nil {
 		stats.DBSize = info.Size()

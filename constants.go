@@ -21,7 +21,7 @@ const metadataKey = "__metadata__"
 
 // Keys stored inside the metadata bucket.
 const (
-	metaSaltKey         = "salt"
+	metaSaltKey         = "salt" // JSON-encoded SaltStore
 	metaVerifyKey       = "verify"
 	rotationWALKey      = "__rotation_wal__"
 	walStatusInProgress = "in_progress"
