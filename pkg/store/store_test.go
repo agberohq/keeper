@@ -6,8 +6,6 @@ import (
 	"testing"
 )
 
-// ── helpers ───────────────────────────────────────────────────────────────
-
 func tempStore(t *testing.T) (*BoltStore, func()) {
 	t.Helper()
 	dir := t.TempDir()
@@ -18,8 +16,6 @@ func tempStore(t *testing.T) (*BoltStore, func()) {
 	return s, func() { s.Close() }
 }
 
-// ── Store interface compliance ─────────────────────────────────────────────
-
 func TestStore_InterfaceCompliance(t *testing.T) {
 	s, cleanup := tempStore(t)
 	defer cleanup()
@@ -27,8 +23,6 @@ func TestStore_InterfaceCompliance(t *testing.T) {
 	var _ Store = s // compile-time check captured at runtime too
 	_ = s
 }
-
-// ── Open / Close ──────────────────────────────────────────────────────────
 
 func TestOpen_CreatesFile(t *testing.T) {
 	dir := t.TempDir()
@@ -54,8 +48,6 @@ func TestClose_Idempotent(t *testing.T) {
 	// make sure it doesn't panic
 	_ = s.Close()
 }
-
-// ── Update / View ─────────────────────────────────────────────────────────
 
 func TestUpdate_CreateBucket(t *testing.T) {
 	s, cleanup := tempStore(t)
@@ -168,8 +160,6 @@ func TestUpdate_Rollback(t *testing.T) {
 		return nil
 	})
 }
-
-// ── Bucket operations ──────────────────────────────────────────────────────
 
 func TestBucket_GetMissing(t *testing.T) {
 	s, cleanup := tempStore(t)
@@ -347,8 +337,6 @@ func TestBucket_NilForMissingTopLevel(t *testing.T) {
 	})
 }
 
-// ── OpenWithOptions ────────────────────────────────────────────────────────
-
 func TestOpenWithOptions_Valid(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "opts.db")
@@ -378,8 +366,6 @@ func TestOpen_BadPath(t *testing.T) {
 	}
 }
 
-// ── Error propagation ──────────────────────────────────────────────────────
-
 func TestUpdate_PropagatesError(t *testing.T) {
 	s, cleanup := tempStore(t)
 	defer cleanup()
@@ -401,8 +387,6 @@ func TestView_PropagatesError(t *testing.T) {
 		t.Fatalf("expected sentinel error, got: %v", err)
 	}
 }
-
-// ── ForEach: error propagation ────────────────────────────────────────────
 
 func TestBucket_ForEach_StopsOnError(t *testing.T) {
 	s, cleanup := tempStore(t)
@@ -453,8 +437,6 @@ func TestTx_ForEach_StopsOnError(t *testing.T) {
 	}
 }
 
-// ── CreateBucketIfNotExists: duplicate nested ──────────────────────────────
-
 func TestBucket_CreateBucketIfNotExists_Idempotent(t *testing.T) {
 	s, cleanup := tempStore(t)
 	defer cleanup()
@@ -471,8 +453,6 @@ func TestBucket_CreateBucketIfNotExists_Idempotent(t *testing.T) {
 		}
 	}
 }
-
-// ── Put then overwrite ─────────────────────────────────────────────────────
 
 func TestBucket_PutOverwrite(t *testing.T) {
 	s, cleanup := tempStore(t)
@@ -492,8 +472,6 @@ func TestBucket_PutOverwrite(t *testing.T) {
 		return nil
 	})
 }
-
-// ── DB() escape hatch ──────────────────────────────────────────────────────
 
 func TestBoltStore_DBAccessor(t *testing.T) {
 	s, cleanup := tempStore(t)
