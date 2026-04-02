@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.0.1)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          # Strip leading 'v' for the version string embedded in the binary
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}"             >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}"     >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          COMMIT:  ${{ steps.version.outputs.commit }}
+          DATE:    ${{ steps.version.outputs.date }}
+        run: |
+          LDFLAGS="-s -w \
+            -X main.version=${VERSION} \
+            -X main.commit=${COMMIT} \
+            -X main.date=${DATE}"
+
+          mkdir -p build dist
+
+          build_and_pack() {
+            local goos="$1" goarch="$2"
+            local name="keeper-${goos}-${goarch}"
+            local out="build/keeper"
+
+            if [ "$goos" = "windows" ]; then
+              out="build/keeper.exe"
+            fi
+
+            GOOS="$goos" GOARCH="$goarch" \
+              go build -ldflags="$LDFLAGS" -trimpath -o "$out" ./cmd/keeper
+
+            if [ "$goos" = "windows" ]; then
+              (cd build && zip "../dist/${name}.zip" keeper.exe)
+              rm build/keeper.exe
+            else
+              (cd build && tar -czf "../dist/${name}.tar.gz" keeper)
+              rm build/keeper
+            fi
+          }
+
+          build_and_pack linux  amd64
+          build_and_pack linux  arm64
+          build_and_pack darwin amd64
+          build_and_pack darwin arm64
+          build_and_pack windows amd64
+          build_and_pack windows arm64
+
+          rm -rf build
+
+          # Checksums
+          cd dist
+          sha256sum * > checksums.txt
+          cd ..
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.tag, '-') }}
+          files: |
+            dist/keeper-linux-amd64.tar.gz
+            dist/keeper-linux-arm64.tar.gz
+            dist/keeper-darwin-amd64.tar.gz
+            dist/keeper-darwin-arm64.tar.gz
+            dist/keeper-windows-amd64.zip
+            dist/keeper-windows-arm64.zip
+            dist/checksums.txt
