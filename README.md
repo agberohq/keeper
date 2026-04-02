@@ -2,9 +2,21 @@
 
 Keeper is a cryptographic secret store for Go. It encrypts arbitrary byte
 payloads at rest using Argon2id key derivation and XChaCha20-Poly1305
-authenticated encryption, and stores them in an embedded bbolt database. It
-is designed to be the foundational secret management layer for the Agbero
-load balancer but is fully self-contained and has no dependency on Agbero.
+authenticated encryption, and stores them in an embedded bbolt database.
+
+It ships as three things you can use independently:
+
+- **A Go library** — embed a hardened secret store directly in your process,
+  with four security levels, per-bucket DEK isolation, and a tamper-evident
+  audit chain.
+- **An HTTP handler** (`x/keephandler`) — mount keeper endpoints on any
+  `net/http` mux in one call, with pluggable hooks, guards, and response
+  encoders for access control and audit logging.
+- **A CLI** (`cmd/keeper`) — a terminal interface with a persistent REPL
+  session, no-echo secret entry, and zero shell-history exposure.
+
+Keeper was designed as the foundational secret management layer for the Agbero
+load balancer but has no dependency on Agbero and works in any Go project.
 
 ---
 
@@ -16,9 +28,12 @@ load balancer but is fully self-contained and has no dependency on Agbero.
 - [Storage schema](#storage-schema)
 - [Audit chain](#audit-chain)
 - [Jack integration](#jack-integration)
+- [x/keepcmd — reusable CLI operations](#xkeepcmd)
+- [x/keephandler — HTTP handler](#xkeephandler)
 - [API reference](#api-reference)
 - [Error catalogue](#error-catalogue)
 - [Security decisions](#security-decisions)
+- [Dependencies](#dependencies)
 
 ---
 
@@ -229,43 +244,20 @@ type Secret struct {
 }
 ```
 
-`EncryptedMeta` holds msgpack-encoded `EncryptedMetadata` encrypted with the
-`keeper-metadata-v1` key derived from the bucket DEK.
-
 ### Versioned salt store
 
 The KDF salt is stored as a JSON-encoded `SaltStore` under the `salt` metadata
 key. Each salt rotation appends a new `SaltEntry` and advances
 `CurrentVersion`. Old entries are retained as an audit trail.
 
-```json
-{
-  "current": 2,
-  "entries": [
-    {"v": 1, "s": "<base64>", "ca": "2025-01-01T00:00:00Z"},
-    {"v": 2, "s": "<base64>", "ca": "2025-06-01T00:00:00Z"}
-  ]
-}
-```
-
 ### Crash-safe rotation WAL
 
-```json
-{
-  "status": "in_progress",
-  "old_hash": "<sha256 of old master key>",
-  "new_hash": "<sha256 of new master key>",
-  "started":  "2025-06-01T12:00:00Z",
-  "last_key": "vault:system:jwt_secret",
-  "wrapped_old_key": "<XChaCha20-Poly1305(newKey, oldKey)>"
-}
-```
-
-`last_key` is the cursor: scheme:namespace:key of the last successfully written
-record. On resume, records at or before the cursor are skipped. `wrapped_old_key`
-allows the old master key to be recovered at resume time without storing it in
-plaintext — it is decrypted with the new master key which `UnlockDatabase` has
-already verified.
+`Rotate` writes a WAL before touching any record. The WAL carries
+`WrappedOldKey`: the pre-rotation master key encrypted with the new master key.
+After a crash the old passphrase is gone; `WrappedOldKey` is the only correct
+way to carry the old key across the boundary. At `UnlockDatabase`, when a WAL
+is present, the new master key decrypts `WrappedOldKey` and rotation resumes
+from the WAL cursor.
 
 ---
 
@@ -285,50 +277,133 @@ to the database but does not know the audit key cannot produce a valid HMAC.
 
 **Key rotation epoch boundary.** At `Rotate`, a checkpoint event is appended
 to every active chain carrying fingerprints of both the outgoing and incoming
-audit keys. The checkpoint is signed with the outgoing key. `VerifyIntegrity`
-segments verification at checkpoint events without rewriting any history.
+audit keys. The checkpoint is signed with the outgoing key.
 
 **Automatic pruning.** When `AuditPruneInterval` is set in `Config`, a
 `jack.Scheduler` runs periodically and calls `PruneEvents` on every registered
 bucket. `LevelHSM` and `LevelRemote` buckets are never pruned regardless of
-this setting. Events are sorted by Seq before trimming; the `chainIndex` is
-rewritten after every deletion.
+this setting.
 
 ---
 
 ## Jack integration
 
 Jack is an optional process supervision library. When a `JackConfig` is
-provided via `WithJack`, keeper activates background components automatically.
+provided via `WithJack`, keeper activates background components automatically:
+auto-lock Looper, per-bucket DEK Reaper, health monitoring patients (bbolt
+read latency + encrypt/decrypt round-trip), audit prune scheduler, and async
+event Pool. Keeper never calls `pool.Shutdown` — the pool lifecycle belongs to
+the caller.
 
-**Auto-lock Looper.** A `jack.Looper` fires at `AutoLockInterval`, checks
-`lastActivity`, and drops all `LevelAdminWrapped` and `LevelHSM`/`LevelRemote`
-DEKs from the Envelope when the idle threshold is exceeded.
+---
 
-**Reaper.** A `jack.Reaper` manages per-bucket DEK TTL for `LevelAdminWrapped`
-buckets independently of the global idle check. `UnlockBucket` and every
-subsequent `Get`/`Set` touch the reaper entry.
+## x/keepcmd
 
-**Health monitoring.** A `jack.Doctor` registers two `jack.Patient` instances:
-one measuring bbolt read latency against a configurable threshold
-(`DBLatencyThreshold`, default 200 ms), and one performing an encrypt/decrypt
-round-trip on a fixed synthetic test vector to confirm the active cipher and key
-are operational. Both patients use a 30-second check interval and switch to a
-5-second accelerated interval on degradation.
+`x/keepcmd` provides reusable keeper operations decoupled from any CLI
+framework. Embed it in your own application to get typed, testable secret
+management without pulling in the CLI binary.
 
-To share a Doctor across multiple Keeper instances, supply one via
-`JackConfig.Doctor`. Otherwise Keeper creates and owns its own.
+```go
+import "github.com/agberohq/keeper/x/keepcmd"
 
-**Audit prune scheduler.** A `jack.Scheduler` runs `PruneEvents` on all
-registered buckets at `AuditPruneInterval` (disabled when zero).
+cmds := &keepcmd.Commands{
+    Store: func() (*keeper.Keeper, error) {
+        return security.KeeperOpen(cfg)  // your own config
+    },
+    Out:     keepcmd.PlainOutput{},
+    NoClose: false, // true in REPL / session contexts
+}
 
-**Pool.** Non-critical audit events are submitted to `jack.Pool` for
-asynchronous execution. Policy creation events remain synchronous.
+cmds.List()
+cmds.Get("vault://system/jwt_secret")
+cmds.Set("vault://system/jwt_secret", "newsecret", keepcmd.SetOptions{})
+cmds.Rotate(newPassphraseBytes)    // caller resolved the passphrase — no prompter dependency
+cmds.RotateSalt(currentPassBytes)  // same
+```
 
-**Shutdown.** `New` registers `store.Lock` with `jack.Shutdown` when a
-`JackShutdown` handle is provided.
+`keepcmd` never calls `prompter` or reads from stdin. Passphrase resolution
+is entirely the caller's responsibility — this keeps the package safe in
+headless server contexts.
 
-Keeper never calls `pool.Shutdown`. The pool lifecycle belongs to the caller.
+`NoClose: true` prevents `Commands` from calling `store.Close()` after each
+operation. Use this in REPL / session contexts where one store is shared
+across many calls.
+
+---
+
+## x/keephandler
+
+`x/keephandler` mounts keeper HTTP endpoints on any `net/http` mux. No
+external router dependency — it uses Go 1.22+ method+pattern routing with
+stdlib `http.ServeMux`.
+
+```go
+import "github.com/agberohq/keeper/x/keephandler"
+
+keephandler.Mount(mux, store,
+    keephandler.WithPrefix("/api/keeper"),
+    keephandler.WithGuard(func(w http.ResponseWriter, r *http.Request, route string) bool {
+        // principal-level access control per route
+        if !acl.Allow(r.Header.Get("X-Principal"), route) {
+            http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
+            return false
+        }
+        return true
+    }),
+    keephandler.WithHooks(
+        keephandler.Hook{
+            Route:       keephandler.RouteGet,
+            CaptureBody: false,
+            After: func(r *http.Request, status int, _ []byte) {
+                audit.Log(r.Context(), route, status)
+            },
+        },
+    ),
+    keephandler.WithEncoder(func(w http.ResponseWriter, route string, status int, data any) {
+        // custom envelope — add tenant ID, trace ID, etc.
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(status)
+        json.NewEncoder(w).Encode(map[string]any{
+            "ok":    status < 400,
+            "route": route,
+            "data":  data,
+        })
+    }),
+    keephandler.WithRoutes(func(m *http.ServeMux) {
+        // application-specific extensions
+        m.HandleFunc("POST /api/keeper/totp/{user}", myTOTPHandler)
+    }),
+)
+```
+
+### Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `{prefix}/unlock` | Unlock the store with a passphrase |
+| `POST` | `{prefix}/lock` | Lock the store |
+| `GET` | `{prefix}/status` | Lock state — safe to poll without auth |
+| `GET` | `{prefix}/keys` | List all secret keys |
+| `GET` | `{prefix}/keys/{key}` | Retrieve a secret value |
+| `POST` | `{prefix}/keys` | Store a secret (JSON or multipart) |
+| `DELETE` | `{prefix}/keys/{key}` | Delete a secret |
+| `POST` | `{prefix}/rotate` | Rotate the master passphrase |
+| `POST` | `{prefix}/rotate/salt` | Rotate the KDF salt |
+| `GET` | `{prefix}/backup` | Stream a database snapshot |
+
+### Hook contract
+
+`BeforeFunc` returns `(allow bool, err error)`.
+
+- `(true, nil)` — let the request proceed.
+- `(false, nil)` — abort; the hook has already written a complete response.
+- `(false, err)` — abort; the framework writes a `500` using `err.Error()`.
+  The hook must **not** have written anything to `w`.
+
+`Hook.CaptureBody bool` controls whether `AfterFunc` receives the response
+body. `false` (default) costs one lightweight `statusWriter` wrapper;
+`true` buffers the full body into a `bytes.Buffer` for the `AfterFunc` — one
+allocation per request.
 
 ---
 
@@ -350,17 +425,11 @@ store, err := keeper.New(keeper.Config{
     Pool:     jackPool,
     Shutdown: jackShutdown,
 }))
-if err != nil {
-    log.Fatal(err)
-}
 defer store.Close()
 
-master, err := store.DeriveMaster([]byte(os.Getenv("KEEPER_PASSPHRASE")))
-if err != nil {
+// Shorthand (wraps DeriveMaster + UnlockDatabase):
+if err := store.Unlock([]byte(os.Getenv("KEEPER_PASSPHRASE"))); err != nil {
     log.Fatal(err) // ErrInvalidPassphrase on wrong passphrase
-}
-if err := store.UnlockDatabase(master); err != nil {
-    log.Fatal(err)
 }
 ```
 
@@ -370,138 +439,65 @@ remaining records automatically before proceeding.
 
 ### LevelPasswordOnly bucket — full lifecycle
 
-`LevelPasswordOnly` buckets are unlocked automatically at `UnlockDatabase`. No
-per-bucket credential is needed.
-
 ```go
-// Create the bucket once (immutable policy).
 err := store.CreateBucket("vault", "system", keeper.LevelPasswordOnly, "init")
 
-// Write and read immediately — no UnlockBucket call needed.
-store.SetNamespacedFull("vault", "system", "jwt_secret", []byte("supersecret"))
-val, err := store.GetNamespacedFull("vault", "system", "jwt_secret")
+store.Set("vault://system/jwt_secret", []byte("supersecret"))
+val, err := store.Get("vault://system/jwt_secret")
 
-// Convenience wrappers use the default scheme.
+// Namespaced convenience wrappers
 store.SetNamespaced("admin", "jwt_secret", secretBytes)
 val, err = store.GetNamespaced("admin", "jwt_secret")
-
-// Or with the full key path.
-store.Set("vault://system/jwt_secret", secretBytes)
-val, err = store.Get("vault://system/jwt_secret")
 ```
 
 ### LevelAdminWrapped bucket — full lifecycle
 
-`LevelAdminWrapped` buckets have a unique random DEK. The master passphrase
-alone cannot decrypt them. Each admin holds an independent wrapped copy of the
-DEK — revoking one admin does not affect others.
-
 ```go
-// Create the bucket (policy is immutable after this call).
 err := store.CreateBucket("finance", "payroll", keeper.LevelAdminWrapped, "ops-team")
-
-// Add the first admin. This generates the random DEK, wraps it under
-// alice's KEK, and immediately seeds the Envelope so the bucket is usable.
 err = store.AddAdminToPolicy("finance", "payroll", "alice", []byte("alicepass"))
 
-// Write secrets while the bucket is unlocked.
 store.SetNamespacedFull("finance", "payroll", "salary_key", []byte("AES256..."))
 
-// Add a second admin (bucket must be unlocked).
-err = store.AddAdminToPolicy("finance", "payroll", "bob", []byte("bobpass"))
-
-// Lock the bucket (drops the DEK from the Envelope).
 store.LockBucket("finance", "payroll")
-
-// Unlock as bob.
 err = store.UnlockBucket("finance", "payroll", "bob", []byte("bobpass"))
-if err != nil {
-    // keeper.ErrAuthFailed — wrong password OR unknown admin ID.
-    // The error deliberately does not distinguish between the two
-    // to prevent admin ID enumeration (CWE-204).
-}
+// ErrAuthFailed — does not distinguish wrong password from unknown admin (CWE-204)
 
-// Read is now available.
-val, err := store.GetNamespacedFull("finance", "payroll", "salary_key")
-
-// Revoke alice. Her wrapped DEK copy is deleted from the policy.
-// The underlying DEK and all secrets are unchanged.
 err = store.RevokeAdmin("finance", "payroll", "alice")
-
-// Re-key this admin's wrapped DEK under a fresh per-bucket salt.
-// Must be called after RotateSalt to keep the wrapped DEK current.
 err = store.RotateAdminWrappedDEK("finance", "payroll", "bob", []byte("bobpass"))
 
-// Check whether a re-key is needed since the last salt rotation.
 needs, err := store.NeedsAdminRekey("finance", "payroll")
 ```
 
-### LevelHSM bucket — full lifecycle
+### LevelHSM / LevelRemote buckets
 
 ```go
-import "github.com/agberohq/keeper/pkg/hsm"
+import (
+    "github.com/agberohq/keeper/pkg/hsm"
+    "github.com/agberohq/keeper/pkg/remote"
+)
 
-// Create a SoftHSM provider (testing only — use a real HSM in production).
-provider, err := hsm.NewSoftHSM()
-if err != nil {
-    log.Fatal(err)
-}
-
-// Open the store and register the provider before UnlockDatabase.
-store, _ := keeper.New(keeper.Config{DBPath: "keeper.db"})
+// SoftHSM — testing only
+provider, _ := hsm.NewSoftHSM()
 store.RegisterHSMProvider("secure", "keys", provider)
+store.CreateBucket("secure", "keys", keeper.LevelHSM, "ops")
 
-// Create the bucket. The DEK is generated and wrapped by the provider here.
-err = store.CreateBucket("secure", "keys", keeper.LevelHSM, "ops")
-// On subsequent opens, RegisterHSMProvider must be called before UnlockDatabase.
-// UnlockDatabase will call provider.UnwrapDEK automatically.
-
-store.UnlockDatabase(master)
-store.SetNamespacedFull("secure", "keys", "api_key", []byte("secret"))
-```
-
-### LevelRemote bucket — full lifecycle
-
-```go
-import "github.com/agberohq/keeper/pkg/remote"
-
-// Use a pre-built adapter for HashiCorp Vault Transit.
+// Vault Transit
 cfg := remote.VaultTransit("https://vault.corp:8200", vaultToken, "my-key")
-// For mTLS:
 cfg.TLSClientCert = "/etc/keeper/client.crt"
 cfg.TLSClientKey  = "/etc/keeper/client.key"
-
-provider, err := remote.New(cfg)
-if err != nil {
-    log.Fatal(err)
-}
-
+provider, _ = remote.New(cfg)
 store.RegisterHSMProvider("tenant", "secrets", provider)
-err = store.CreateBucket("tenant", "secrets", keeper.LevelRemote, "ops")
+store.CreateBucket("tenant", "secrets", keeper.LevelRemote, "ops")
 ```
-
-AWS KMS and GCP Cloud KMS adapters are available as `remote.AWSKMS` and
-`remote.GCPKMS`. For any other service, populate `remote.Config` directly
-using `WrapRequestTemplate` and `WrapResponseJSONPath` to match the service's
-request and response format.
 
 ### Key rotation
 
 ```go
-// Rotate the master passphrase. Re-encrypts all LevelPasswordOnly secrets.
-// LevelAdminWrapped, LevelHSM, and LevelRemote secrets are unaffected.
-// The WAL ensures this is crash-safe and resumes automatically on next unlock.
-if err := store.Rotate([]byte("new-passphrase")); err != nil {
-    log.Fatal(err)
-}
+// Rotate passphrase — crash-safe WAL, resumes on next Unlock if interrupted
+store.Rotate([]byte("new-passphrase"))
 
-// Rotate the KDF salt independently of the passphrase.
-// Generates a new random salt, re-derives the master key, and re-encrypts
-// all LevelPasswordOnly secrets. LevelAdminWrapped buckets are logged as
-// needing a follow-up RotateAdminWrappedDEK call.
-if err := store.RotateSalt([]byte("current-passphrase")); err != nil {
-    log.Fatal(err)
-}
+// Rotate KDF salt — re-derives master key, re-encrypts LevelPasswordOnly
+store.RotateSalt([]byte("current-passphrase"))
 ```
 
 ### Compare-and-swap
@@ -509,7 +505,7 @@ if err := store.RotateSalt([]byte("current-passphrase")); err != nil {
 ```go
 err := store.CompareAndSwapNamespacedFull("vault", "system", "counter",
     []byte("old"), []byte("new"))
-// Returns ErrCASConflict if the current value does not match old.
+// ErrCASConflict if current value does not match old
 ```
 
 ### Backup
@@ -527,19 +523,19 @@ info, err := store.Backup(f)
 | Error | Meaning |
 |---|---|
 | `ErrStoreLocked` | Operation attempted while the store is locked |
-| `ErrInvalidPassphrase` | Wrong master passphrase in `DeriveMaster` or `Unlock` |
-| `ErrAuthFailed` | Any authentication failure in `UnlockBucket` — does not distinguish wrong password from unknown admin ID |
+| `ErrInvalidPassphrase` | Wrong master passphrase |
+| `ErrAuthFailed` | Any `UnlockBucket` failure — does not distinguish wrong password from unknown admin ID (CWE-204) |
 | `ErrKeyNotFound` | Secret key does not exist |
 | `ErrBucketLocked` | Bucket has not been unlocked |
-| `ErrPolicyImmutable` | Attempt to create a second policy for an existing bucket |
-| `ErrPolicyNotFound` | No policy exists for the given scheme/namespace |
-| `ErrAdminNotFound` | Admin ID not in policy — returned by `RevokeAdmin` only, not by `UnlockBucket` |
-| `ErrHSMProviderNil` | `LevelHSM` or `LevelRemote` bucket created without a registered `HSMProvider` |
-| `ErrCheckLatency` | Database read latency exceeded `DBLatencyThreshold` in the health patient |
-| `ErrCASConflict` | Current value does not match expected value in `CompareAndSwap` |
-| `ErrSecurityDowngrade` | Cross-bucket move/copy from higher to lower security level without `confirmDowngrade=true` |
+| `ErrPolicyImmutable` | Second policy for an existing bucket |
+| `ErrPolicyNotFound` | No policy for the given scheme/namespace |
+| `ErrAdminNotFound` | Admin ID not in policy — `RevokeAdmin` only |
+| `ErrHSMProviderNil` | HSM/Remote bucket created without a registered provider |
+| `ErrCheckLatency` | DB read latency exceeded `DBLatencyThreshold` |
+| `ErrCASConflict` | Current value does not match expected in `CompareAndSwap` |
+| `ErrSecurityDowngrade` | Cross-bucket move from higher to lower security level |
 | `ErrAlreadyUnlocked` | `UnlockDatabase` called on an already-unlocked store |
-| `ErrMasterRequired` | `UnlockDatabase` called with a nil or destroyed `Master` |
+| `ErrMasterRequired` | `UnlockDatabase` called with nil or destroyed `Master` |
 | `ErrChainBroken` | Audit chain integrity verification failed |
 | `ErrMetadataDecrypt` | Encrypted metadata could not be decrypted |
 | `ErrPolicySignature` | Policy HMAC verification failed — record was tampered |
@@ -548,83 +544,39 @@ info, err := store.Backup(f)
 
 ## Security decisions
 
-### ErrAuthFailed unifies all UnlockBucket failures (CWE-204 / CVSS 5.3)
+**ErrAuthFailed unifies all UnlockBucket failures (CWE-204 / CVSS 5.3).** Both
+an unknown admin ID and a wrong password return `ErrAuthFailed`. This prevents
+admin ID enumeration by timing or error-string comparison. `RevokeAdmin` retains
+`ErrAdminNotFound` because it is an administrative operation on an
+already-unlocked store.
 
-`UnlockBucket` returns `ErrAuthFailed` for both an unknown admin ID and a wrong
-password. This prevents an attacker from enumerating valid admin IDs by
-observing which error is returned. `RevokeAdmin` retains `ErrAdminNotFound`
-because it is an administrative operation on an already-unlocked store where
-the caller legitimately needs to know whether the ID exists.
+**Argon2id dominates timing.** Argon2id takes 200–500 ms on typical hardware.
+Post-derivation comparison differences are four or more orders of magnitude
+smaller and are not measurable remotely. No artificial equalisation is applied.
 
-### Argon2id dominates timing — no dummy code in DeriveMaster
+**DEK retrieved inside the CAS transaction boundary.** `CompareAndSwapNamespacedFull`
+retrieves the bucket DEK inside the bbolt write transaction, eliminating the
+window where a concurrent `Rotate` could change the DEK between retrieval and
+use.
 
-Argon2id takes 200–500 ms on typical hardware. Any difference in the
-post-derivation comparison is four or more orders of magnitude smaller and is
-not measurable remotely. No artificial timing equalisation is applied.
+**Passphrase never stored as a Go string in the HTTP handler.** All three
+passphrase fields (`passphrase`, `new_passphrase`) are decoded from JSON
+directly into `[]byte` via raw-map extraction, keeping the string backing array
+off the long-lived heap. The `[]byte` copy is zeroed with `wipeBytes` after use.
 
-### DEK retrieved inside the CAS transaction boundary
+**No `--passphrase` flag in the CLI.** Flags appear in `ps` output and shell
+history. The CLI accepts the passphrase only from `KEEPER_PASSPHRASE` env or
+an interactive no-echo prompt.
 
-`CompareAndSwapNamespacedFull` retrieves the bucket DEK inside the bbolt write
-transaction closure. This eliminates the window where a concurrent `Rotate`
-could change the DEK between retrieval and use.
+**REPL secret values are never visible.** `set <key>` in the REPL uses
+`term.ReadPassword` for the value — it does not appear in terminal scrollback,
+shell history, or `ps`.
 
-### LevelHSM and LevelRemote buckets skipped during master key rotation
+**LevelHSM and LevelRemote buckets skipped during master key rotation.**
+`reencryptAllWithKey` and `RotateSalt` explicitly skip these buckets. The DEK
+is provider-controlled; master salt rotation does not affect it.
 
-`reencryptAllWithKey` and `RotateSalt` explicitly skip `LevelHSM` and
-`LevelRemote` buckets and log a structured info message for each. The DEK is
-provider-controlled; master salt rotation does not affect it.
-
-### LevelAdminWrapped salt rotation gap and RotateAdminWrappedDEK
-
-`RotateSalt` re-derives the master key under a new KDF salt but does not
-re-key `LevelAdminWrapped` WrappedDEKs. Those DEKs are encrypted with a KEK
-derived from `HKDF(masterKey‖adminCred, dekSalt)` where `dekSalt` is a
-per-bucket salt independent of the master KDF salt. After `RotateSalt`, a
-structured Warn is logged for each `LevelAdminWrapped` bucket. Admins should
-call `RotateAdminWrappedDEK` to generate a fresh `dekSalt` and re-wrap their
-copy. `NeedsAdminRekey` reports whether a bucket's `LastRekeyed` timestamp
-predates the current master salt generation.
-
-### Slice copy before secureZero
-
-`mbCopy := make([]byte, len(masterBytes)); copy(mbCopy, masterBytes)` is used
-before `zero.Bytes(masterBytes)` throughout. A plain assignment aliases the
-backing array; zeroing it would corrupt a concurrent reader. The copy gives
-each caller exclusive ownership of its byte slice.
-
-### msgpack on the Secret hot path
-
-All `Secret` and `EncryptedMetadata` records use
-`github.com/vmihailenco/msgpack/v5`. Policy records remain JSON — they are
-written infrequently and must be human-readable for forensic purposes.
-
-### Policy authenticated with HMAC after unlock
-
-The unauthenticated SHA-256 hash detects accidental corruption and simple
-tampering before unlock. The HMAC-SHA256 tag detects deliberate tampering by an
-adversary who has write access to the database file and can update both the
-record and its SHA-256 hash. Both tags are written atomically with the policy
-record in one bbolt.Update.
-
-### Crash-safe rotation with WrappedOldKey
-
-`Rotate` writes a WAL before touching any record. The WAL carries
-`WrappedOldKey`: the pre-rotation master key encrypted with the new master key.
-After a crash the old passphrase is gone; `WrappedOldKey` is the only correct
-way to carry the old key across the boundary. At `UnlockDatabase`, when a WAL
-is present, the new master key decrypts `WrappedOldKey` and rotation resumes
-from the WAL cursor. Both keys exist in plaintext simultaneously only for the
-duration of each individual `reencryptRecord` call.
-
-### Versioned salt store with legacy migration
-
-The KDF salt is stored as a `SaltStore` with versioned `SaltEntry` records.
-`loadSaltStore` detects the legacy format (a bare 32-byte value, first byte
-not `{`) and migrates it in-place on first read, wrapping it in a versioned
-store at version 1.
-
-### Audit chain covers ID, BucketID, Scheme, and Namespace
-
-The checksum hashes ID, BucketID, Scheme, Namespace, Details, EventType, and
-Timestamp. This prevents an event from one chain being transplanted to another
-chain without detection.
+**Crash-safe rotation with WrappedOldKey.** `Rotate` writes a WAL before
+touching any record. The WAL carries `WrappedOldKey`: the pre-rotation master
+key encrypted with the new master key. After a crash, `UnlockDatabase` decrypts
+`WrappedOldKey` using the verified new key and resumes rotation from the cursor.
