@@ -270,7 +270,7 @@ func TestCommands_RotateSaltEmptyPassphrase(t *testing.T) {
 	}
 }
 
-// ── NoClose / session mode ────────────────────────────────────────────────────
+// NoClose / session mode
 
 // TestNoClose_StoreRemainsOpenAcrossOperations verifies that when NoClose is
 // true the store is not closed after each command, allowing multiple sequential

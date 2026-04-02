@@ -91,7 +91,7 @@ func (p *Input) Run() (*Result, error) {
 	return NewResult(result), nil
 }
 
-// ── SecretInput ───────────────────────────────────────────────────────────────
+// SecretInput
 
 // SecretInput reads a single secret value from the terminal with no echo.
 // It is intentionally simpler than Input — no confirmation, no min-length —
@@ -128,7 +128,7 @@ func ReadSecret(prompt string) (*Result, error) {
 	return NewResult(result), nil
 }
 
-// ── Select ────────────────────────────────────────────────────────────────────
+// Select
 
 // Select displays a numbered list of choices on stderr and reads the user's
 // selection from stdin. It does not use raw mode — the user sees their input.
@@ -169,7 +169,7 @@ func Confirm(prompt string) (bool, error) {
 	return line == "y" || line == "Y", nil
 }
 
-// ── internal ──────────────────────────────────────────────────────────────────
+// internal
 
 func wipeSlice(b []byte) {
 	for i := range b {

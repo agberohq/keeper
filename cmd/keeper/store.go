@@ -10,9 +10,9 @@ import (
 )
 
 // initStore handles the new-database flow:
-//  1. Confirms with the user that they want to create a DB at dbPath.
-//  2. Prompts for a new passphrase with confirmation.
-//  3. Opens the store and unlocks it (first unlock writes the verification hash).
+// Confirms with the user that they want to create a DB at dbPath.
+// Prompts for a new passphrase with confirmation.
+// Opens the store and unlocks it (first unlock writes the verification hash).
 //
 // Returns an open, unlocked Keeper. The caller must call Close when done.
 func initStore(dbPath string) (*keeper.Keeper, error) {
@@ -54,8 +54,8 @@ func initStore(dbPath string) (*keeper.Keeper, error) {
 
 // openStore opens and unlocks an existing keeper.Keeper at dbPath.
 // Passphrase resolution order:
-//  1. KEEPER_PASSPHRASE environment variable
-//  2. Interactive prompt via pkg/prompter (secure, no echo)
+// KEEPER_PASSPHRASE environment variable
+// Interactive prompt via pkg/prompter (secure, no echo)
 func openStore(dbPath string) (*keeper.Keeper, error) {
 	store, err := keeper.New(keeper.Config{DBPath: dbPath})
 	if err != nil {

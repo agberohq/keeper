@@ -19,12 +19,13 @@ type dbResolution struct {
 }
 
 // resolveDBPath returns the database path from, in order:
-//  1. The --db flag value (passed as flagDB, may be empty)
-//  2. The KEEPER_DB environment variable
-//  3. A *.db file found in the current directory
-//     — if exactly one found: use it
-//     — if multiple found: prompt via huh to select one
-//     — if none found: return "keeper.db" in the current directory with isNew=true
+// The --db flag value (passed as flagDB, may be empty)
+// The KEEPER_DB environment variable
+// A *.db file found in the current directory
+//
+//	— if exactly one found: use it
+//	— if multiple found: prompt via huh to select one
+//	— if none found: return "keeper.db" in the current directory with isNew=true
 //
 // isNew is true only when the resolved path does not yet exist on disk.
 // The caller is responsible for prompting the user before creating the store.

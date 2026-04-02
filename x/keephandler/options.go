@@ -113,7 +113,7 @@ func hooksFor(routeName string, hooks []Hook) (Hook, bool) {
 	return Hook{}, false
 }
 
-// ── Hook ─────────────────────────────────────────────────────────────────────
+// Hook
 
 // RouteNames is the set of valid Hook.Route values, one per built-in endpoint.
 const (
@@ -183,7 +183,7 @@ type Hook struct {
 	CaptureBody bool
 }
 
-// ── ResponseEncoder ──────────────────────────────────────────────────────────
+// ResponseEncoder
 
 // ResponseEncoder writes the HTTP response for a route. It is called by every
 // route handler instead of the built-in jsonOK / jsonError.
@@ -196,7 +196,7 @@ type Hook struct {
 // code, and writing the body. The default encoder writes flat JSON.
 type ResponseEncoder func(w http.ResponseWriter, route string, status int, data any)
 
-// ── GuardFunc ────────────────────────────────────────────────────────────────
+// GuardFunc
 
 // GuardFunc is an optional access-control function injected via WithGuard.
 // It is called on every protected route after the built-in locked-check passes,

@@ -17,7 +17,7 @@ import (
 	"github.com/agberohq/keeper/x/keephandler"
 )
 
-// ── test server helpers ───────────────────────────────────────────────────────
+// test server helpers
 
 // newTestServer creates an httptest.Server with a fresh unlocked keeper store
 // mounted at /keeper. The store is closed when the test ends.
@@ -95,7 +95,7 @@ func readJSON(t *testing.T, resp *http.Response) map[string]any {
 	return m
 }
 
-// ── status ────────────────────────────────────────────────────────────────────
+// status
 
 func TestStatus_Unlocked(t *testing.T) {
 	srv, _ := newTestServer(t)
@@ -125,7 +125,7 @@ func TestStatus_Locked(t *testing.T) {
 	}
 }
 
-// ── unlock / lock ─────────────────────────────────────────────────────────────
+// unlock / lock
 
 func TestUnlock_ValidPassphrase(t *testing.T) {
 	srv := newLockedServer(t)
@@ -171,7 +171,7 @@ func TestLock(t *testing.T) {
 	}
 }
 
-// ── list ──────────────────────────────────────────────────────────────────────
+// list
 
 func TestList_Empty(t *testing.T) {
 	srv, _ := newTestServer(t)
@@ -216,7 +216,7 @@ func TestList_WhenLocked(t *testing.T) {
 	}
 }
 
-// ── get ───────────────────────────────────────────────────────────────────────
+// get
 
 func TestGet_Existing(t *testing.T) {
 	srv, _ := newTestServer(t)
@@ -254,7 +254,7 @@ func TestGet_WhenLocked(t *testing.T) {
 	}
 }
 
-// ── set ───────────────────────────────────────────────────────────────────────
+// set
 
 func TestSet_JSON(t *testing.T) {
 	srv, _ := newTestServer(t)
@@ -333,7 +333,7 @@ func TestSet_WhenLocked(t *testing.T) {
 	}
 }
 
-// ── delete ────────────────────────────────────────────────────────────────────
+// delete
 
 func TestDelete_Existing(t *testing.T) {
 	srv, _ := newTestServer(t)
@@ -376,7 +376,7 @@ func TestDelete_WhenLocked(t *testing.T) {
 	}
 }
 
-// ── rotate ────────────────────────────────────────────────────────────────────
+// rotate
 
 func TestRotate(t *testing.T) {
 	srv, store := newTestServer(t)
@@ -400,7 +400,7 @@ func TestRotate_MissingPassphrase(t *testing.T) {
 	}
 }
 
-// ── backup ────────────────────────────────────────────────────────────────────
+// backup
 
 func TestBackup(t *testing.T) {
 	srv, store := newTestServer(t)
@@ -435,7 +435,7 @@ func TestBackup_WhenLocked(t *testing.T) {
 	}
 }
 
-// ── custom prefix ─────────────────────────────────────────────────────────────
+// custom prefix
 
 func TestMount_CustomPrefix(t *testing.T) {
 	srv, _ := newTestServer(t, keephandler.WithPrefix("/api/v1/secrets"))
@@ -447,7 +447,7 @@ func TestMount_CustomPrefix(t *testing.T) {
 	}
 }
 
-// ── WithRoutes extension ──────────────────────────────────────────────────────
+// WithRoutes extension
 
 func TestMount_WithRoutes(t *testing.T) {
 	srv, _ := newTestServer(t, keephandler.WithRoutes(func(m *http.ServeMux) {
@@ -463,7 +463,7 @@ func TestMount_WithRoutes(t *testing.T) {
 	}
 }
 
-// ── nil store ─────────────────────────────────────────────────────────────────
+// nil store
 
 func TestMount_NilStore(t *testing.T) {
 	mux := http.NewServeMux()
@@ -485,7 +485,7 @@ func TestMount_NilStore(t *testing.T) {
 	}
 }
 
-// ── round-trip ────────────────────────────────────────────────────────────────
+// round-trip
 
 func TestRoundTrip_SetGetDelete(t *testing.T) {
 	srv, _ := newTestServer(t)
@@ -514,7 +514,7 @@ func TestRoundTrip_SetGetDelete(t *testing.T) {
 	}
 }
 
-// ── WithHooks — Before ────────────────────────────────────────────────────────
+// WithHooks — Before
 
 // TestHook_Before_Allow verifies that a Before hook returning (true, nil)
 // lets the request proceed and the real handler response is returned.
@@ -612,7 +612,7 @@ func TestHook_Before_OnlyTargetRoute(t *testing.T) {
 	}
 }
 
-// ── WithHooks — After (status-only) ──────────────────────────────────────────
+// WithHooks — After (status-only)
 
 // TestHook_After_StatusOnly verifies that After receives the correct status
 // code when CaptureBody is false.
@@ -641,7 +641,7 @@ func TestHook_After_StatusOnly(t *testing.T) {
 	}
 }
 
-// ── WithHooks — After (capture body) ─────────────────────────────────────────
+// WithHooks — After (capture body)
 
 // TestHook_After_CaptureBody verifies that After receives the full response
 // body when CaptureBody is true, and that the client also receives it.
@@ -685,7 +685,7 @@ func TestHook_After_CaptureBody(t *testing.T) {
 	}
 }
 
-// ── WithEncoder ───────────────────────────────────────────────────────────────
+// WithEncoder
 
 // TestWithEncoder_CustomEnvelope verifies that a custom ResponseEncoder can
 // wrap responses in an application-specific envelope.
@@ -742,7 +742,7 @@ func TestWithEncoder_ErrorShape(t *testing.T) {
 	}
 }
 
-// ── WithGuard ─────────────────────────────────────────────────────────────────
+// WithGuard
 
 // TestWithGuard_Allow verifies that a GuardFunc returning true lets
 // the request proceed normally.

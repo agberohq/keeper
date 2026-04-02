@@ -1,7 +1,7 @@
 # keeper
 
 Keeper is a cryptographic secret store for Go. It encrypts arbitrary byte
-payloads at rest using Argon2id key derivation and XChaCha20-Poly1305
+payloads at rest using Argon2id key derivation and XChaCha20-Poly1305 (default)
 authenticated encryption, and stores them in an embedded bbolt database.
 
 It ships as three things you can use independently:
@@ -15,7 +15,7 @@ It ships as three things you can use independently:
 - **A CLI** (`cmd/keeper`) — a terminal interface with a persistent REPL
   session, no-echo secret entry, and zero shell-history exposure.
 
-Keeper was designed as the foundational secret management layer for the Agbero
+Keeper was designed as the foundational secret management layer for the [Agbero](https://github.com/agberohq/agbero)
 load balancer but has no dependency on Agbero and works in any Go project.
 
 ---

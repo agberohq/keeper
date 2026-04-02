@@ -87,7 +87,7 @@ func (h *handler) guardRequest(w http.ResponseWriter, r *http.Request, route str
 	return true
 }
 
-// ── hookWrap ─────────────────────────────────────────────────────────────────
+// hookWrap
 
 // hookWrap wraps fn with the lifecycle functions in hook.
 // The enc parameter is used only to write the internal-error response when
@@ -158,7 +158,7 @@ func (s *statusWriter) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
-// ── default encoder ───────────────────────────────────────────────────────────
+// default encoder
 
 // defaultEncoder writes flat JSON. It is the ResponseEncoder used when the
 // caller does not supply WithEncoder.

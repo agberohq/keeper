@@ -265,7 +265,7 @@ func (h *handler) backup(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// helpers
 
 // extractFieldBytes decodes a single named string field from a JSON request
 // body directly into []byte. This avoids storing the field value in an
