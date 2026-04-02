@@ -2,17 +2,17 @@ package prompter
 
 import "fmt"
 
-// PromptFormatter is a function that formats a prompt string
+// Formatter formats a prompt string for display.
 type Formatter func(prompt string) string
 
-// WithConfirm adds confirmation prompt
+// WithConfirm adds a confirmation prompt.
 func WithConfirm() func(*Input) {
 	return func(p *Input) {
 		p.confirm = true
 	}
 }
 
-// WithConfirmMsg custom confirmation prompt message
+// WithConfirmMsg sets a custom confirmation prompt message and enables confirmation.
 func WithConfirmMsg(msg string) func(*Input) {
 	return func(p *Input) {
 		p.confirm = true
@@ -20,14 +20,14 @@ func WithConfirmMsg(msg string) func(*Input) {
 	}
 }
 
-// WithMismatchMsg custom mismatch error message
+// WithMismatchMsg sets the error message shown when confirmation does not match.
 func WithMismatchMsg(msg string) func(*Input) {
 	return func(p *Input) {
 		p.mismatchMsg = msg
 	}
 }
 
-// WithRequired marks password as required
+// WithRequired marks the input as required (non-empty).
 func WithRequired(required bool, msg string) func(*Input) {
 	return func(p *Input) {
 		p.required = required
@@ -35,7 +35,7 @@ func WithRequired(required bool, msg string) func(*Input) {
 	}
 }
 
-// WithMinLength sets minimum password length
+// WithMinLength sets a minimum byte length for the entered value.
 func WithMinLength(n int, msg string) func(*Input) {
 	return func(p *Input) {
 		p.minLength = n
@@ -43,17 +43,17 @@ func WithMinLength(n int, msg string) func(*Input) {
 	}
 }
 
-// defaultPromptFormatter is the default prompt formatter
+// defaultPromptFormatter is the default prompt formatter.
 func defaultPromptFormatter(prompt string) string {
 	return fmt.Sprintf("%s: ", prompt)
 }
 
-// Quick prompts for a single password with minimal options
+// Quick prompts for a single password with minimal options.
 func Quick(prompt string) (*Result, error) {
 	return NewInput(prompt).Run()
 }
 
-// QuickWithConfirm prompts for a password with confirmation
+// QuickWithConfirm prompts for a password with confirmation.
 func QuickWithConfirm(prompt string) (*Result, error) {
 	return NewInput(prompt, WithConfirm()).Run()
 }

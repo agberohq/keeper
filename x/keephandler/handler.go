@@ -172,13 +172,3 @@ func defaultEncoder(w http.ResponseWriter, _ string, status int, data any) {
 func errData(msg string) map[string]string {
 	return map[string]string{"error": msg}
 }
-
-// wipeBytes zeros a byte slice in place.
-func wipeBytes(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
-}
-
-// maxUploadBytes is the maximum accepted multipart file size (4 MiB).
-const maxUploadBytes = 4 << 20
