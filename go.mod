@@ -8,7 +8,7 @@ require (
 	github.com/olekukonko/errors v1.2.0
 	github.com/olekukonko/jack v0.0.0-20260315063850-82b24943796a
 	github.com/olekukonko/ll v0.1.8
-	github.com/olekukonko/zero v0.0.0-20260401163106-d916bce9a71d
+	github.com/olekukonko/zero v0.0.0-20260402164708-e3505a21b60e
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	go.etcd.io/bbolt v1.4.3
 	golang.org/x/crypto v0.49.0
