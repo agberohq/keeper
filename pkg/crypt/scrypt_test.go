@@ -1,14 +1,12 @@
-package crypt_test
+package crypt
 
 import (
 	"bytes"
 	"testing"
-
-	"github.com/agberohq/keeper/pkg/crypt"
 )
 
 func TestScryptKDF_DeriveKey(t *testing.T) {
-	kdf := crypt.DefaultScryptKDF()
+	kdf := DefaultScryptKDF()
 	password := []byte("testpassword")
 	salt := []byte("testsalt1234567")
 
@@ -34,7 +32,7 @@ func TestScryptKDF_DeriveKey(t *testing.T) {
 }
 
 func TestScryptKDF_Errors(t *testing.T) {
-	kdf := crypt.DefaultScryptKDF()
+	kdf := DefaultScryptKDF()
 	salt := []byte("salt")
 
 	if _, err := kdf.DeriveKey(nil, salt, 32); err == nil {
@@ -49,5 +47,5 @@ func TestScryptKDF_Errors(t *testing.T) {
 }
 
 func TestScryptKDF_ImplementsKDF(t *testing.T) {
-	var _ crypt.KDF = crypt.DefaultScryptKDF()
+	var _ KDF = DefaultScryptKDF()
 }
