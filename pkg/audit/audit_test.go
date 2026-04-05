@@ -1,4 +1,4 @@
-package audit_test
+package audit
 
 import (
 	"bytes"
@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agberohq/keeper/pkg/audit"
 	"github.com/agberohq/keeper/pkg/store"
 )
 
@@ -22,29 +21,29 @@ func (f *failingStore) View(fn func(tx store.Tx) error) error {
 	return f.viewErr
 }
 
-func newStore(t *testing.T) *audit.Store {
+func newStore(t *testing.T) *Store {
 	t.Helper()
-	s := audit.New(store.NewMemStore(), nil)
+	s := New(store.NewMemStore(), nil)
 	if err := s.Init(); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 	return s
 }
 
-func newStoreWithKey(t *testing.T, key []byte) *audit.Store {
+func newStoreWithKey(t *testing.T, key []byte) *Store {
 	t.Helper()
-	s := audit.New(store.NewMemStore(), key)
+	s := New(store.NewMemStore(), key)
 	if err := s.Init(); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 	return s
 }
 
-func chain(t *testing.T, s *audit.Store, scheme, namespace string, n int) {
+func chain(t *testing.T, s *Store, scheme, namespace string, n int) {
 	t.Helper()
 	prev := s.LastChecksum(scheme, namespace)
 	for i := 0; i < n; i++ {
-		e := &audit.Event{
+		e := &Event{
 			ID:           fmt.Sprintf("%s-%s-%d", scheme, namespace, i),
 			BucketID:     "b",
 			Scheme:       scheme,
@@ -62,7 +61,7 @@ func chain(t *testing.T, s *audit.Store, scheme, namespace string, n int) {
 	}
 }
 
-func injectCorruptEvent(t *testing.T, s *audit.Store, scheme, namespace string, corruptFunc func(*audit.Event)) {
+func injectCorruptEvent(t *testing.T, s *Store, scheme, namespace string, corruptFunc func(*Event)) {
 	t.Helper()
 	// Load existing events
 	events, err := s.LoadChain(scheme, namespace)
@@ -113,7 +112,7 @@ func TestVerifyIntegrity_Valid(t *testing.T) {
 }
 
 func TestVerifyIntegrity_ChecksumFailureViaEvent(t *testing.T) {
-	e := &audit.Event{
+	e := &Event{
 		EventType:    "test",
 		Details:      []byte(`{"k":"v"}`),
 		Timestamp:    time.Now(),
@@ -128,7 +127,7 @@ func TestVerifyIntegrity_ChecksumFailureViaEvent(t *testing.T) {
 
 func TestVerifyIntegrity_PrevChecksumFailureViaEvent(t *testing.T) {
 	// Create two events where second has wrong PrevChecksum
-	e1 := &audit.Event{
+	e1 := &Event{
 		EventType:    "test1",
 		Details:      []byte(`{}`),
 		Timestamp:    time.Now(),
@@ -136,7 +135,7 @@ func TestVerifyIntegrity_PrevChecksumFailureViaEvent(t *testing.T) {
 	}
 	e1.Checksum = e1.ComputeChecksum("")
 
-	e2 := &audit.Event{
+	e2 := &Event{
 		EventType:    "test2",
 		Details:      []byte(`{}`),
 		Timestamp:    time.Now().Add(time.Second),
@@ -150,7 +149,7 @@ func TestVerifyIntegrity_PrevChecksumFailureViaEvent(t *testing.T) {
 	prev := e1.Checksum
 	if e2.PrevChecksum != prev {
 		// This is the condition VerifyIntegrity checks - we verify it works
-		if err := audit.ErrChainBroken; err == nil {
+		if err := ErrChainBroken; err == nil {
 			t.Error("ErrChainBroken should be defined")
 		}
 	}
@@ -158,7 +157,7 @@ func TestVerifyIntegrity_PrevChecksumFailureViaEvent(t *testing.T) {
 
 func TestVerifyIntegrity_LoadChainError(t *testing.T) {
 	fs := &failingStore{MemStore: store.NewMemStore(), viewErr: errors.New("view failed")}
-	s := audit.New(fs, nil)
+	s := New(fs, nil)
 	_ = s.Init()
 	err := s.VerifyIntegrity("sc", "ns")
 	if err == nil {
@@ -245,7 +244,7 @@ func TestLoadChain_Empty(t *testing.T) {
 
 func TestComputeChecksum_Deterministic(t *testing.T) {
 	ts := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-	e := &audit.Event{EventType: "op", Details: []byte("{}"), Timestamp: ts}
+	e := &Event{EventType: "op", Details: []byte("{}"), Timestamp: ts}
 	if e.ComputeChecksum("a") != e.ComputeChecksum("a") {
 		t.Error("not deterministic")
 	}
@@ -256,7 +255,7 @@ func TestComputeChecksum_Deterministic(t *testing.T) {
 
 func TestVerifyChecksum_Valid(t *testing.T) {
 	ts := time.Now()
-	e := &audit.Event{
+	e := &Event{
 		EventType:    "test",
 		Details:      []byte(`{"key":"value"}`),
 		Timestamp:    ts,
@@ -270,7 +269,7 @@ func TestVerifyChecksum_Valid(t *testing.T) {
 
 func TestVerifyChecksum_Invalid(t *testing.T) {
 	ts := time.Now()
-	e := &audit.Event{
+	e := &Event{
 		EventType:    "test",
 		Details:      []byte(`{"key":"value"}`),
 		Timestamp:    ts,
@@ -283,7 +282,7 @@ func TestVerifyChecksum_Invalid(t *testing.T) {
 }
 
 func TestComputeHMAC_EmptyKey(t *testing.T) {
-	e := &audit.Event{ID: "test"}
+	e := &Event{ID: "test"}
 	if hmac := e.ComputeHMAC(nil); hmac != "" {
 		t.Errorf("expected empty HMAC with nil key, got %q", hmac)
 	}
@@ -294,7 +293,7 @@ func TestComputeHMAC_EmptyKey(t *testing.T) {
 
 func TestComputeHMAC_WithKey(t *testing.T) {
 	key := []byte("secret")
-	e := &audit.Event{
+	e := &Event{
 		ID:           "id1",
 		BucketID:     "b1",
 		Scheme:       "s1",
@@ -321,7 +320,7 @@ func TestComputeHMAC_WithKey(t *testing.T) {
 }
 
 func TestVerifyHMAC_EmptyKey(t *testing.T) {
-	e := &audit.Event{HMAC: "anything"}
+	e := &Event{HMAC: "anything"}
 	if !e.VerifyHMAC(nil) {
 		t.Error("VerifyHMAC should return true with nil key")
 	}
@@ -331,7 +330,7 @@ func TestVerifyHMAC_EmptyKey(t *testing.T) {
 }
 
 func TestVerifyHMAC_EmptyHMAC(t *testing.T) {
-	e := &audit.Event{HMAC: ""}
+	e := &Event{HMAC: ""}
 	if !e.VerifyHMAC([]byte("key")) {
 		t.Error("VerifyHMAC should return true with empty HMAC field")
 	}
@@ -339,7 +338,7 @@ func TestVerifyHMAC_EmptyHMAC(t *testing.T) {
 
 func TestVerifyHMAC_Valid(t *testing.T) {
 	key := []byte("secret")
-	e := &audit.Event{
+	e := &Event{
 		ID:           "id1",
 		BucketID:     "b1",
 		Scheme:       "s1",
@@ -359,7 +358,7 @@ func TestVerifyHMAC_Valid(t *testing.T) {
 
 func TestVerifyHMAC_Invalid(t *testing.T) {
 	key := []byte("secret")
-	e := &audit.Event{
+	e := &Event{
 		ID:           "id1",
 		HMAC:         "invalid",
 		BucketID:     "b1",
@@ -378,8 +377,8 @@ func TestVerifyHMAC_Invalid(t *testing.T) {
 }
 
 func TestAppend_Uninitialized(t *testing.T) {
-	s := audit.New(store.NewMemStore(), nil)
-	e := &audit.Event{ID: "test"}
+	s := New(store.NewMemStore(), nil)
+	e := &Event{ID: "test"}
 	err := s.Append("sc", "ns", e)
 	if err == nil {
 		t.Error("expected error when appending to uninitialized store")
@@ -391,7 +390,7 @@ func TestVerifyIntegrity_HMACPathCovered(t *testing.T) {
 	s := newStoreWithKey(t, key)
 
 	// Append valid event - HMAC will be set correctly by Append
-	e := &audit.Event{
+	e := &Event{
 		ID:           "test",
 		BucketID:     "b",
 		Scheme:       "sc",
@@ -422,7 +421,7 @@ func TestLoadChain_SortByTimestamp(t *testing.T) {
 	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	for i := 0; i < 3; i++ {
-		e := &audit.Event{
+		e := &Event{
 			ID:           fmt.Sprintf("ev-%d", i),
 			Scheme:       "sc",
 			Namespace:    "ns",
@@ -449,17 +448,17 @@ func TestLoadChain_SortByTimestamp(t *testing.T) {
 }
 
 func TestErrChainBroken(t *testing.T) {
-	if audit.ErrChainBroken == nil {
+	if ErrChainBroken == nil {
 		t.Error("ErrChainBroken should be defined")
 	}
-	if !errors.Is(fmt.Errorf("wrapped: %w", audit.ErrChainBroken), audit.ErrChainBroken) {
+	if !errors.Is(fmt.Errorf("wrapped: %w", ErrChainBroken), ErrChainBroken) {
 		t.Error("ErrChainBroken should work with errors.Is")
 	}
 }
 
 func TestEventJSONRoundTrip(t *testing.T) {
 	ts := time.Now().UTC()
-	original := &audit.Event{
+	original := &Event{
 		ID:           "test-id",
 		BucketID:     "bucket-1",
 		Scheme:       "scheme-1",
@@ -478,7 +477,7 @@ func TestEventJSONRoundTrip(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 
-	var loaded audit.Event
+	var loaded Event
 	if err := json.Unmarshal(data, &loaded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
@@ -498,7 +497,7 @@ func TestAppend_WithSigningKey(t *testing.T) {
 	key := []byte("test-key")
 	s := newStoreWithKey(t, key)
 
-	e := &audit.Event{
+	e := &Event{
 		ID:           "test",
 		Scheme:       "sc",
 		Namespace:    "ns",
@@ -542,7 +541,7 @@ func TestPrune_WithOldEvents(t *testing.T) {
 	// Create events with old timestamps
 	base := time.Now().Add(-24 * time.Hour)
 	for i := 0; i < 5; i++ {
-		e := &audit.Event{
+		e := &Event{
 			ID:           fmt.Sprintf("old-%d", i),
 			Scheme:       "pr",
 			Namespace:    "ns",

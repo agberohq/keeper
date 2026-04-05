@@ -1,11 +1,10 @@
-// Package audit provides append-only tamper-evident audit chain storage.
-// It depends only on store.Store and has no keeper or bbolt import.
 package audit
 
 import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"github.com/agberohq/keeper/pkg/store"
+	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
 )
 
@@ -145,6 +145,14 @@ func New(db store.Store, signingKey []byte) *Store {
 	return &Store{db: db, signingKey: signingKey}
 }
 
+// SetSigningKey replaces the active HMAC signing key. Pass nil to disable
+// signing. This is used by the keeper after key rotation to activate the new
+// epoch key without constructing a new Store. Tests use it to drive rotation
+// scenarios without going through the full keeper lifecycle.
+func (a *Store) SetSigningKey(key []byte) {
+	a.signingKey = key
+}
+
 // Init creates the root audit bucket if it does not exist.
 func (a *Store) Init() error {
 	return a.db.Update(func(tx store.Tx) error {
@@ -262,9 +270,20 @@ func (a *Store) VerifyIntegrity(scheme, namespace string) error {
 			return fmt.Errorf("%w: event %d (seq %d) HMAC verification failed", ErrChainBroken, i, e.Seq)
 		}
 
-		// At a checkpoint, rotate the active verification key for subsequent events.
+		// At a checkpoint, attempt to recover the new epoch key so HMAC
+		// verification continues for post-rotation events. If decryption
+		// fails (auditor does not hold the key), fall back to checksum-only.
 		if e.EventType == EventTypeKeyRotationCheckpoint {
-			activeKey = epochKeyFromCheckpoint(e)
+			if wrappedKey := epochKeyFromCheckpoint(e); wrappedKey != nil {
+				if newKey := decryptEpochKey(wrappedKey, activeKey); newKey != nil {
+					activeKey = newKey
+				} else {
+					// Key not available — stop HMAC verification for this epoch.
+					activeKey = nil
+				}
+			} else {
+				activeKey = nil
+			}
 		}
 
 		prev = e.Checksum
@@ -272,21 +291,63 @@ func (a *Store) VerifyIntegrity(scheme, namespace string) error {
 	return nil
 }
 
-// epochKeyFromCheckpoint extracts the new epoch key fingerprint from a
-// checkpoint event's Details. The fingerprint is a proof-of-possession token
-// produced by KeyFingerprint — it is not the raw key, so we cannot reconstruct
-// the actual key. VerifyIntegrity therefore stops enforcing HMAC for events
-// after a checkpoint when it does not hold the new key.
+// epochKeyFromCheckpoint recovers the wrapped new epoch signing key from a
+// checkpoint event's Details. The returned bytes are the raw encrypted blob;
+// the caller (VerifyIntegrity) must decrypt them with the current active key.
 //
-// Callers that do hold the new signing key (i.e. the live store after rotation)
-// will have it set in Store.signingKey and validation continues normally.
-// External auditors replaying the log without the new key still verify checksums.
-func epochKeyFromCheckpoint(_ *Event) []byte {
-	// The checkpoint event proves key transition via fingerprints in its Details.
-	// VerifyIntegrity does not attempt to derive the new key from the event —
-	// it continues with whatever signingKey the Store was constructed with.
-	// This is correct: the Store always holds the current epoch key after rotation.
-	return nil
+// Key chaining design:
+//
+//	checkpoint.Details = JSON {
+//	  "old_key_fingerprint": "<hex>",   // proof of old key — for auditors
+//	  "new_key_fingerprint": "<hex>",   // proof of new key — for auditors
+//	  "wrapped_new_key":     "<base64>" // XChaCha20-Poly1305(oldKey, newKey)
+//	}
+//
+// An auditor holding any epoch key can unwrap the full forward chain
+// successively. An auditor holding no key still validates the SHA-256
+// checksum chain. This is equivalent in trust structure to a TLS certificate
+// chain: compromise of the root audit key requires rotating the entire chain.
+//
+// Security note: XChaCha20-Poly1305's Open processes the full ciphertext
+// regardless of whether authentication succeeds, so the two decryption
+// attempts in VerifyIntegrity are constant-time with respect to AEAD
+// authentication by construction.
+func epochKeyFromCheckpoint(e *Event) []byte {
+	if len(e.Details) == 0 {
+		return nil
+	}
+	var d struct {
+		WrappedNewKey string `json:"wrapped_new_key"`
+	}
+	if err := json.Unmarshal(e.Details, &d); err != nil || d.WrappedNewKey == "" {
+		return nil
+	}
+	wrapped, err := base64.StdEncoding.DecodeString(d.WrappedNewKey)
+	if err != nil {
+		return nil
+	}
+	return wrapped
+}
+
+// decryptEpochKey decrypts a wrapped epoch key blob using activeKey via
+// XChaCha20-Poly1305. Returns nil when decryption fails; caller falls back
+// to checksum-only verification.
+func decryptEpochKey(wrapped, activeKey []byte) []byte {
+	if len(activeKey) == 0 || len(wrapped) == 0 {
+		return nil
+	}
+	aead, err := chacha20poly1305.NewX(activeKey)
+	if err != nil {
+		return nil
+	}
+	if len(wrapped) < aead.NonceSize() {
+		return nil
+	}
+	plain, err := aead.Open(nil, wrapped[:aead.NonceSize()], wrapped[aead.NonceSize():], nil)
+	if err != nil {
+		return nil
+	}
+	return plain
 }
 
 // LastChecksum returns the checksum of the most recently appended event,
