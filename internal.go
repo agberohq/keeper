@@ -108,7 +108,28 @@ func (s *Keeper) isBucketUnlocked(scheme, namespace string) bool {
 	return policy.Level == LevelPasswordOnly
 }
 
-// unlockBucketPasswordOnly places the master key (as DEK) into the Envelope.
+// deriveBucketDEK derives a per-bucket 32-byte DEK from the master key using
+// HKDF-SHA256, domain-separated by scheme and namespace.
+//
+//	bucketDEK = HKDF-SHA256(ikm=masterKey, salt=nil, info="keeper-bucket-dek-v1:<scheme>:<namespace>")
+//
+// Each LevelPasswordOnly bucket gets an independent key. Leaking one bucket's
+// DEK does not expose the master key or any other bucket's secrets.
+// The info string is fixed — changing it is a breaking on-disk format change.
+func deriveBucketDEK(masterKey []byte, scheme, namespace string) ([]byte, error) {
+	info := hkdfInfoBucketDEK + ":" + scheme + ":" + namespace
+	r := hkdf.New(sha256.New, masterKey, nil, []byte(info))
+	key := make([]byte, masterKeyLen)
+	if _, err := io.ReadFull(r, key); err != nil {
+		return nil, fmt.Errorf("deriveBucketDEK: HKDF failed for %s:%s: %w", scheme, namespace, err)
+	}
+	return key, nil
+}
+
+// unlockBucketPasswordOnly derives the per-bucket DEK and places it into the
+// Envelope. When a migration is in progress both the new derived key and the
+// old master-key-as-DEK are seeded so records can be decrypted regardless of
+// which epoch they were written in.
 func (s *Keeper) unlockBucketPasswordOnly(scheme, namespace string) error {
 	if s.master == nil {
 		return ErrStoreLocked
@@ -117,11 +138,32 @@ func (s *Keeper) unlockBucketPasswordOnly(scheme, namespace string) error {
 	if err != nil {
 		return err
 	}
-	buf := memguard.NewBufferFromBytes(masterBytes)
+	defer zero.Bytes(masterBytes)
+
+	newDEK, err := deriveBucketDEK(masterBytes, scheme, namespace)
+	if err != nil {
+		return err
+	}
+
+	buf := memguard.NewBufferFromBytes(newDEK)
+	zero.Bytes(newDEK)
 	if buf.Size() == 0 {
-		return fmt.Errorf("failed to allocate buffer for master key")
+		return fmt.Errorf("failed to allocate buffer for bucket DEK")
 	}
 	s.envelope.Hold(scheme, namespace, buf)
+
+	// During migration the old key (master key used directly as DEK) must also
+	// be available so unmigrated records can be decrypted. The fallback decrypt
+	// path tries the new derived key first, then falls back to the old key.
+	// XChaCha20-Poly1305 Open processes the full ciphertext before returning an
+	// error, so both attempts take the same time — no timing side-channel.
+	if atomic.LoadInt32(&s.migrationState) == int32(MigrationInProgress) {
+		oldBuf := memguard.NewBufferFromBytes(masterBytes)
+		if oldBuf.Size() > 0 {
+			s.envelope.HoldOld(scheme, namespace, oldBuf)
+		}
+	}
+
 	s.logger.Fields("scheme", scheme, "namespace", namespace).Debug("bucket seeded (password-only)")
 	return nil
 }
@@ -232,7 +274,29 @@ func (s *Keeper) decrypt(ciphertext []byte, scheme, namespace string) ([]byte, e
 		return nil, err
 	}
 	defer zero.Bytes(key)
-	return s.decryptWithKey(ciphertext, key)
+
+	pt, err := s.decryptWithKey(ciphertext, key)
+	if err == nil {
+		return pt, nil
+	}
+
+	// Fallback: if the new derived key fails and a pre-migration old key is
+	// available, try decrypting with it. This handles records written before
+	// the per-bucket DEK derivation migration completed.
+	//
+	// XChaCha20-Poly1305 Open processes the full ciphertext before returning
+	// an authentication error, so both attempts take the same time — no
+	// timing side-channel leaks which key succeeded.
+	oldBuf, oldErr := s.envelope.RetrieveOld(scheme, namespace)
+	if oldErr != nil {
+		return nil, err // original error — no fallback key available
+	}
+	oldKey := make([]byte, oldBuf.Size())
+	copy(oldKey, oldBuf.Bytes())
+	oldBuf.Destroy()
+	defer zero.Bytes(oldKey)
+
+	return s.decryptWithKey(ciphertext, oldKey)
 }
 
 func (s *Keeper) encryptWithKey(plaintext, key []byte) ([]byte, error) {
@@ -374,6 +438,24 @@ func (s *Keeper) encryptAllRecords(newKey, oldKey []byte, wal *RotationWAL) erro
 				continue
 			}
 
+			// Derive the effective per-bucket DEKs for this namespace.
+			// Records may be in either epoch:
+			//   • pre-migration:  encrypted under the raw master key
+			//   • post-migration: encrypted under deriveBucketDEK(masterKey, scheme, ns)
+			// effectiveOld is tried first; rawOld is the fallback.
+			// effectiveNew is always the derived DEK from the new master so that
+			// unlockBucketPasswordOnly will find the right key after rotation.
+			effectiveOld, errOld := deriveBucketDEK(oldKey, schemeName, nsName)
+			if errOld != nil {
+				return fmt.Errorf("derive old bucket DEK for %s:%s: %w", schemeName, nsName, errOld)
+			}
+			defer zero.Bytes(effectiveOld)
+			effectiveNew, errNew := deriveBucketDEK(newKey, schemeName, nsName)
+			if errNew != nil {
+				return fmt.Errorf("derive new bucket DEK for %s:%s: %w", schemeName, nsName, errNew)
+			}
+			defer zero.Bytes(effectiveNew)
+
 			var keys []string
 			if err := s.db.View(func(tx pkgstore.Tx) error {
 				nb := s.getNamespaceBucket(tx, schemeName, nsName)
@@ -395,7 +477,7 @@ func (s *Keeper) encryptAllRecords(newKey, oldKey []byte, wal *RotationWAL) erro
 				if wal.LastKey != "" && cursor <= wal.LastKey {
 					continue // already completed before crash
 				}
-				if err := s.reencryptRecord(schemeName, nsName, key, newKey, oldKey); err != nil {
+				if err := s.reencryptRecord(schemeName, nsName, key, effectiveNew, effectiveOld, oldKey); err != nil {
 					return err
 				}
 				wal.LastKey = cursor
@@ -408,8 +490,23 @@ func (s *Keeper) encryptAllRecords(newKey, oldKey []byte, wal *RotationWAL) erro
 	return nil
 }
 
-// reencryptRecord re-encrypts a single secret in one atomic bbolt.Update.
-func (s *Keeper) reencryptRecord(scheme, namespace, key string, newKey, oldKey []byte) error {
+// reencryptRecord re-encrypts a single secret in one atomic bbolt.Update
+// during a master key rotation. For LevelPasswordOnly buckets the on-disk
+// records may be encrypted under either the raw master key (pre-migration) or
+// the per-bucket derived DEK (post-migration). This function accepts the two
+// effective old keys in priority order: effectiveOld is tried first (the
+// derived bucket DEK from the old master), then rawOld (the raw master key) as
+// a fallback for records that have not yet been through DEK migration. The
+// output is always written under effectiveNew (the derived bucket DEK from the
+// new master), which matches what unlockBucketPasswordOnly will derive after
+// the rotation completes.
+//
+// For non-LevelPasswordOnly buckets (LevelHSM, LevelRemote) this function is
+// never called — they are skipped in encryptAllRecords. For callers that
+// process buckets where both old keys are identical (e.g. the raw master key
+// equals the derived key, which cannot happen in practice) the fallback is a
+// no-op.
+func (s *Keeper) reencryptRecord(scheme, namespace, key string, effectiveNew, effectiveOld, rawOld []byte) error {
 	return s.db.Update(func(tx pkgstore.Tx) error {
 		nb := s.getNamespaceBucket(tx, scheme, namespace)
 		if nb == nil {
@@ -423,11 +520,20 @@ func (s *Keeper) reencryptRecord(scheme, namespace, key string, newKey, oldKey [
 		if err := unmarshalSecret(v, &secret); err != nil {
 			return fmt.Errorf("unmarshal %s: %w", key, err)
 		}
-		pt, err := s.decryptWithKey(secret.Ciphertext, oldKey)
-		if err != nil {
-			return fmt.Errorf("decrypt %s: %w", key, err)
+
+		// Try the derived old DEK first (already-migrated record), then the
+		// raw master key (not-yet-migrated record). Track which key succeeded
+		// so we use the correct meta key for decrypting EncryptedMeta below.
+		pt, err := s.decryptWithKey(secret.Ciphertext, effectiveOld)
+		decryptedWithDerived := err == nil
+		if !decryptedWithDerived {
+			pt, err = s.decryptWithKey(secret.Ciphertext, rawOld)
+			if err != nil {
+				return fmt.Errorf("decrypt %s: %w", key, err)
+			}
 		}
-		ct, err := s.encryptWithKey(pt, newKey)
+
+		ct, err := s.encryptWithKey(pt, effectiveNew)
 		zero.Bytes(pt)
 		if err != nil {
 			return fmt.Errorf("encrypt %s: %w", key, err)
@@ -435,7 +541,13 @@ func (s *Keeper) reencryptRecord(scheme, namespace, key string, newKey, oldKey [
 		secret.Ciphertext = ct
 
 		if len(secret.EncryptedMeta) > 0 {
-			oldMetaKey, merr := s.deriveMetaKey(oldKey)
+			// The meta key is derived from whichever DEK was used to encrypt
+			// the record. Use the matching key so decryption succeeds.
+			oldDecryptKey := rawOld
+			if decryptedWithDerived {
+				oldDecryptKey = effectiveOld
+			}
+			oldMetaKey, merr := s.deriveMetaKey(oldDecryptKey)
 			if merr != nil {
 				return fmt.Errorf("derive old meta key: %w", merr)
 			}
@@ -444,7 +556,7 @@ func (s *Keeper) reencryptRecord(scheme, namespace, key string, newKey, oldKey [
 			if merr != nil {
 				return fmt.Errorf("decrypt meta %s: %w", key, merr)
 			}
-			newMetaKey, merr := s.deriveMetaKey(newKey)
+			newMetaKey, merr := s.deriveMetaKey(effectiveNew)
 			if merr != nil {
 				return fmt.Errorf("derive new meta key: %w", merr)
 			}
@@ -1052,4 +1164,239 @@ func (s *Keeper) decryptMetaWithKey(data, metaKey []byte) (*EncryptedMetadata, e
 		return nil, fmt.Errorf("%w: %v", ErrMetadataDecrypt, err)
 	}
 	return &meta, nil
+}
+
+// ── Per-bucket DEK derivation migration ──────────────────────────────────────
+
+// runMigrationBatch re-encrypts up to batchSize records across all
+// LevelPasswordOnly buckets using the new per-bucket derived DEK.
+//
+// Crash safety: a per-bucket WAL cursor is written to the metadata bucket
+// before each record is migrated. On restart the cursor lets the looper skip
+// already-migrated records without re-doing work.
+//
+// Returns (true, nil) when every bucket is fully migrated and the completion
+// marker has been written.
+func (s *Keeper) runMigrationBatch(batchSize int) (complete bool, err error) {
+	// Snapshot the registry under RLock so we don't race with CreateBucket /
+	// loadPolicy which write s.schemeRegistry while holding s.mu.Lock/RLock.
+	// Release the lock immediately after the snapshot — migrateBucket does
+	// long-running bbolt operations that must not hold s.mu.
+	type bucketRef = migrationBucket
+	var buckets []bucketRef
+	func() {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		buckets = append(buckets, bucketRef{s.defaultScheme, s.defaultNs})
+		for _, policy := range s.schemeRegistry {
+			if policy.Level == LevelPasswordOnly {
+				key := policy.Scheme + ":" + policy.Namespace
+				defaultKey := s.defaultScheme + ":" + s.defaultNs
+				if key != defaultKey {
+					buckets = append(buckets, bucketRef{policy.Scheme, policy.Namespace})
+				}
+			}
+		}
+	}()
+
+	remaining := batchSize
+	for _, b := range buckets {
+		if remaining <= 0 {
+			return false, nil
+		}
+		n, done, berr := s.migrateBucket(b.scheme, b.namespace, remaining)
+		if berr != nil {
+			return false, berr
+		}
+		remaining -= n
+		if !done {
+			return false, nil // still work to do in this bucket
+		}
+		// Bucket fully migrated — drop the old fallback key from memory.
+		s.envelope.DropOld(b.scheme, b.namespace)
+	}
+
+	// All buckets complete — write the marker and clean up WAL cursors atomically.
+	if err := s.writeMigrationDoneMarker(buckets); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// migrateBucket re-encrypts up to limit records in scheme:namespace from the
+// old master-key DEK to the new derived DEK. Returns (n, done, err) where n
+// is the number of records processed and done is true when the bucket is fully
+// migrated.
+func (s *Keeper) migrateBucket(scheme, namespace string, limit int) (n int, done bool, err error) {
+	masterBytes, err := s.master.Bytes()
+	if err != nil {
+		return 0, false, err
+	}
+	oldKey := make([]byte, len(masterBytes))
+	copy(oldKey, masterBytes)
+	zero.Bytes(masterBytes)
+	defer zero.Bytes(oldKey)
+
+	newKey, err := deriveBucketDEK(oldKey, scheme, namespace)
+	if err != nil {
+		return 0, false, err
+	}
+	defer zero.Bytes(newKey)
+
+	// Read the WAL cursor for this bucket.
+	walKey := metaBucketDEKWALPrefix + scheme + ":" + namespace
+	var cursorAfter string
+	_ = s.db.View(func(tx pkgstore.Tx) error {
+		b := tx.Bucket([]byte(metaBucket))
+		if b != nil {
+			if v := b.Get([]byte(walKey)); v != nil {
+				cursorAfter = string(v)
+			}
+		}
+		return nil
+	})
+
+	// Collect keys to migrate.
+	var keys []string
+	_ = s.db.View(func(tx pkgstore.Tx) error {
+		nb := s.getNamespaceBucket(tx, scheme, namespace)
+		if nb == nil {
+			return nil
+		}
+		return nb.ForEach(func(k, _ []byte) error {
+			ks := string(k)
+			if ks == metadataKey {
+				return nil
+			}
+			if cursorAfter == "" || ks > cursorAfter {
+				keys = append(keys, ks)
+			}
+			return nil
+		})
+	})
+
+	if len(keys) == 0 {
+		return 0, true, nil // bucket fully migrated
+	}
+
+	processed := 0
+	for _, key := range keys {
+		if processed >= limit {
+			return processed, false, nil
+		}
+		if err := s.migrateRecord(scheme, namespace, key, oldKey, newKey, walKey); err != nil {
+			return processed, false, err
+		}
+		processed++
+	}
+
+	// If we processed all keys the bucket is done.
+	done = processed == len(keys)
+	if done {
+		// Clear the WAL cursor for this bucket.
+		_ = s.db.Update(func(tx pkgstore.Tx) error {
+			b := tx.Bucket([]byte(metaBucket))
+			if b != nil {
+				_ = b.Delete([]byte(walKey))
+			}
+			return nil
+		})
+	}
+
+	if s.config.BucketDEKMigrationProgress != nil {
+		s.config.BucketDEKMigrationProgress(scheme, namespace, processed, len(keys))
+	}
+
+	return processed, done, nil
+}
+
+// migrateRecord re-encrypts a single secret record from oldKey to newKey in
+// one atomic bbolt.Update and advances the WAL cursor.
+func (s *Keeper) migrateRecord(scheme, namespace, key string, oldKey, newKey []byte, walKey string) error {
+	return s.db.Update(func(tx pkgstore.Tx) error {
+		nb := s.getNamespaceBucket(tx, scheme, namespace)
+		if nb == nil {
+			return nil
+		}
+		data := nb.Get([]byte(key))
+		if data == nil {
+			return nil
+		}
+		var secret Secret
+		if err := unmarshalSecret(data, &secret); err != nil {
+			return fmt.Errorf("migrate unmarshal %s: %w", key, err)
+		}
+
+		// Try decrypting with newKey first (already migrated records).
+		// Fall back to oldKey for unmigrated records.
+		pt, err := s.decryptWithKey(secret.Ciphertext, newKey)
+		if err != nil {
+			pt, err = s.decryptWithKey(secret.Ciphertext, oldKey)
+			if err != nil {
+				return fmt.Errorf("migrate decrypt %s: %w", key, err)
+			}
+		}
+
+		ct, err := s.encryptWithKey(pt, newKey)
+		zero.Bytes(pt)
+		if err != nil {
+			return fmt.Errorf("migrate encrypt %s: %w", key, err)
+		}
+		secret.Ciphertext = ct
+
+		// Re-encrypt metadata if present.
+		if len(secret.EncryptedMeta) > 0 {
+			oldMetaKey, merr := s.deriveMetaKey(oldKey)
+			if merr == nil {
+				meta, merr2 := s.decryptMetaWithKey(secret.EncryptedMeta, oldMetaKey)
+				zero.Bytes(oldMetaKey)
+				if merr2 == nil {
+					newMetaKey, merr3 := s.deriveMetaKey(newKey)
+					if merr3 == nil {
+						newEM, merr4 := s.encryptMetaWithKey(meta, newMetaKey)
+						zero.Bytes(newMetaKey)
+						if merr4 == nil {
+							secret.EncryptedMeta = newEM
+						}
+					}
+				}
+			}
+		}
+
+		encoded, err := marshalSecret(&secret)
+		if err != nil {
+			return err
+		}
+		if err := nb.Put([]byte(key), encoded); err != nil {
+			return err
+		}
+
+		// Advance WAL cursor.
+		b := tx.Bucket([]byte(metaBucket))
+		if b != nil {
+			_ = b.Put([]byte(walKey), []byte(key))
+		}
+		return nil
+	})
+}
+
+// writeMigrationDoneMarker writes the completion marker and deletes all WAL
+// cursor entries in a single atomic transaction.
+type migrationBucket struct{ scheme, namespace string }
+
+func (s *Keeper) writeMigrationDoneMarker(buckets []migrationBucket) error {
+	return s.db.Update(func(tx pkgstore.Tx) error {
+		b := tx.Bucket([]byte(metaBucket))
+		if b == nil {
+			return nil
+		}
+		if err := b.Put([]byte(metaBucketDEKDoneKey), []byte("1")); err != nil {
+			return err
+		}
+		for _, bk := range buckets {
+			walKey := metaBucketDEKWALPrefix + bk.scheme + ":" + bk.namespace
+			_ = b.Delete([]byte(walKey))
+		}
+		return nil
+	})
 }

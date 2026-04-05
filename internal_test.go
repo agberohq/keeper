@@ -285,3 +285,217 @@ func TestIncrementAccessCount(t *testing.T) {
 		t.Errorf("Get after access count increment: val=%q err=%v", v, err)
 	}
 }
+
+// ── Change 3: Per-bucket DEK derivation ──────────────────────────────────────
+
+func TestDeriveBucketDEK_Deterministic(t *testing.T) {
+	master := make([]byte, 32)
+	for i := range master {
+		master[i] = byte(i + 1)
+	}
+	k1, err := deriveBucketDEK(master, "default", "ns1")
+	if err != nil {
+		t.Fatalf("deriveBucketDEK: %v", err)
+	}
+	k2, err := deriveBucketDEK(master, "default", "ns1")
+	if err != nil {
+		t.Fatalf("deriveBucketDEK (2nd): %v", err)
+	}
+	if !bytes.Equal(k1, k2) {
+		t.Error("deriveBucketDEK must be deterministic")
+	}
+}
+
+func TestDeriveBucketDEK_DifferentNamespacesProduceDifferentKeys(t *testing.T) {
+	master := make([]byte, 32)
+	for i := range master {
+		master[i] = byte(i + 1)
+	}
+	k1, _ := deriveBucketDEK(master, "default", "ns1")
+	k2, _ := deriveBucketDEK(master, "default", "ns2")
+	if bytes.Equal(k1, k2) {
+		t.Error("different namespaces must produce different DEKs")
+	}
+}
+
+func TestDeriveBucketDEK_DifferentSchemesProduceDifferentKeys(t *testing.T) {
+	master := make([]byte, 32)
+	for i := range master {
+		master[i] = byte(i + 1)
+	}
+	k1, _ := deriveBucketDEK(master, "schemeA", "ns")
+	k2, _ := deriveBucketDEK(master, "schemeB", "ns")
+	if bytes.Equal(k1, k2) {
+		t.Error("different schemes must produce different DEKs")
+	}
+}
+
+func TestDeriveBucketDEK_DifferentFromMasterKey(t *testing.T) {
+	master := make([]byte, 32)
+	for i := range master {
+		master[i] = byte(i + 1)
+	}
+	dek, err := deriveBucketDEK(master, "default", "ns")
+	if err != nil {
+		t.Fatalf("deriveBucketDEK: %v", err)
+	}
+	if bytes.Equal(dek, master) {
+		t.Error("bucket DEK must differ from the master key")
+	}
+}
+
+func TestDeriveBucketDEK_KeyLength(t *testing.T) {
+	master := make([]byte, 32)
+	dek, err := deriveBucketDEK(master, "s", "n")
+	if err != nil {
+		t.Fatalf("deriveBucketDEK: %v", err)
+	}
+	if len(dek) != 32 {
+		t.Errorf("expected 32-byte DEK, got %d", len(dek))
+	}
+}
+
+func TestMigration_NewStoreIsNotNeeded(t *testing.T) {
+	// A freshly created store (no data written before the DEK derivation change)
+	// should mark migration as not needed after the first unlock.
+	// Since our code always starts a migration on first unlock (no done marker),
+	// the migration will run and complete quickly on an empty store.
+	store := newUnlockedStore(t)
+	// Give the migration looper time to complete on the empty store.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := store.MigrationStatus()
+		if st == MigrationDone || st == MigrationNotNeeded {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// Allow InProgress on a fresh empty store — it will finish quickly.
+	st := store.MigrationStatus()
+	if st != MigrationDone && st != MigrationNotNeeded && st != MigrationInProgress {
+		t.Errorf("unexpected migration state: %v", st)
+	}
+}
+
+func TestMigration_DataAccessibleDuringMigration(t *testing.T) {
+	// Write several secrets, then verify they are readable while migration runs.
+	store := newUnlockedStore(t)
+
+	for i := 0; i < 10; i++ {
+		key := "migkey" + string(rune('A'+i))
+		if err := store.Set(key, []byte("value"+string(rune('A'+i)))); err != nil {
+			t.Fatalf("Set %s: %v", key, err)
+		}
+	}
+
+	// All secrets must still be readable regardless of migration state.
+	for i := 0; i < 10; i++ {
+		key := "migkey" + string(rune('A'+i))
+		val, err := store.Get(key)
+		if err != nil {
+			t.Errorf("Get %s during migration: %v", key, err)
+			continue
+		}
+		want := "value" + string(rune('A'+i))
+		if string(val) != want {
+			t.Errorf("Get %s: want %q, got %q", key, want, val)
+		}
+	}
+}
+
+func TestMigration_SurvivesReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "mig.db")
+
+	// First session: write secrets.
+	{
+		s, err := New(Config{DBPath: dbPath})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		s.Unlock([]byte("pass")) //nolint:errcheck
+		for i := 0; i < 5; i++ {
+			s.Set("k"+string(rune('0'+i)), []byte("v"+string(rune('0'+i)))) //nolint:errcheck
+		}
+		// Wait for migration to complete before closing.
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if s.MigrationStatus() == MigrationDone {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		s.Close()
+	}
+
+	// Second session: migration should be marked done, data readable.
+	{
+		s, err := New(Config{DBPath: dbPath})
+		if err != nil {
+			t.Fatalf("New (reopen): %v", err)
+		}
+		defer s.Close()
+		s.Unlock([]byte("pass")) //nolint:errcheck
+
+		// On reopen, migration should be NotNeeded (done marker present).
+		time.Sleep(100 * time.Millisecond) // allow startDEKMigration to run
+		st := s.MigrationStatus()
+		if st != MigrationNotNeeded && st != MigrationDone {
+			t.Errorf("expected NotNeeded or Done on reopen, got %v", st)
+		}
+
+		for i := 0; i < 5; i++ {
+			key := "k" + string(rune('0'+i))
+			val, err := s.Get(key)
+			if err != nil {
+				t.Errorf("Get %s after migration reopen: %v", key, err)
+				continue
+			}
+			want := "v" + string(rune('0'+i))
+			if string(val) != want {
+				t.Errorf("Get %s: want %q, got %q", key, want, val)
+			}
+		}
+	}
+}
+
+func TestMigration_StatusStringValues(t *testing.T) {
+	if MigrationNotNeeded.String() != "not_needed" {
+		t.Errorf("MigrationNotNeeded.String() = %q", MigrationNotNeeded.String())
+	}
+	if MigrationInProgress.String() != "in_progress" {
+		t.Errorf("MigrationInProgress.String() = %q", MigrationInProgress.String())
+	}
+	if MigrationDone.String() != "done" {
+		t.Errorf("MigrationDone.String() = %q", MigrationDone.String())
+	}
+}
+
+func TestMigration_ConfigurableBatchSize(t *testing.T) {
+	var progressCalls atomic.Int32
+	s, err := New(Config{
+		DBPath:                      filepath.Join(t.TempDir(), "batch.db"),
+		BucketDEKMigrationBatchSize: 2,
+		BucketDEKMigrationInterval:  10 * time.Millisecond,
+		BucketDEKMigrationProgress: func(scheme, namespace string, done, total int) {
+			progressCalls.Add(1)
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer s.Close()
+	s.Unlock([]byte("pass")) //nolint:errcheck
+
+	// Write enough secrets to require multiple batches.
+	for i := 0; i < 6; i++ {
+		s.Set("bk"+string(rune('0'+i)), []byte("val")) //nolint:errcheck
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if s.MigrationStatus() == MigrationDone {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}

@@ -100,6 +100,35 @@ type JackConfig struct {
 	Doctor   JackDoctor
 }
 
+// MigrationState reports the per-bucket DEK derivation migration status.
+// Returned by Keeper.MigrationStatus and surfaced in GET /keeper/status.
+type MigrationState int
+
+const (
+	// MigrationNotNeeded means the database was created after per-bucket DEK
+	// derivation was introduced; no migration is required.
+	MigrationNotNeeded MigrationState = iota
+	// MigrationInProgress means the background looper is still re-encrypting
+	// records from the old master-key-as-DEK format.
+	MigrationInProgress
+	// MigrationDone means all LevelPasswordOnly records have been re-encrypted
+	// under their per-bucket derived DEK.
+	MigrationDone
+)
+
+func (m MigrationState) String() string {
+	switch m {
+	case MigrationNotNeeded:
+		return "not_needed"
+	case MigrationInProgress:
+		return "in_progress"
+	case MigrationDone:
+		return "done"
+	default:
+		return "unknown"
+	}
+}
+
 // Config holds all configuration for a Keeper instance.
 type Config struct {
 	DBPath           string
@@ -127,6 +156,20 @@ type Config struct {
 
 	KDF       crypt.KDF
 	NewCipher func(key []byte) (crypt.Cipher, error)
+
+	// BucketDEKMigrationBatchSize is the number of records to re-encrypt per
+	// migration looper tick. Default 500. Reduce to 50 in I/O-constrained
+	// environments to limit write amplification.
+	BucketDEKMigrationBatchSize int
+
+	// BucketDEKMigrationInterval is the pause between migration batches.
+	// Default 100ms. At defaults: 100k records migrate in ~20s with no
+	// perceptible service impact.
+	BucketDEKMigrationInterval time.Duration
+
+	// BucketDEKMigrationProgress is called after each batch with cumulative
+	// progress. Optional — safe to leave nil.
+	BucketDEKMigrationProgress func(scheme, namespace string, done, total int)
 
 	Argon2Time              uint32
 	Argon2Memory            uint32

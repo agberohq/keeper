@@ -61,9 +61,22 @@ type Keeper struct {
 	policyKey      []byte // HMAC key for policy authentication; nil when locked
 
 	// Jack-managed background components; nil when running without Jack.
-	autoLocker     *jack.Looper
-	jackReaper     *jack.Reaper
-	pruneScheduler *jack.Scheduler
+	autoLocker      *jack.Looper
+	jackReaper      *jack.Reaper
+	pruneScheduler  *jack.Scheduler
+	migrationLooper *jack.Looper
+
+	// migrationState tracks the per-bucket DEK derivation migration.
+	// Accessed atomically: 0=NotNeeded, 1=InProgress, 2=Done.
+	migrationState int32
+
+	// migrationStopCh is closed by Lock()/Close() to signal the migration
+	// watcher goroutine to stop. migrationStoppedCh is closed by the watcher
+	// after looper.Stop() returns, allowing Lock() to wait for full drain.
+	// Lock() must never call looper.Stop() directly — jack's Stop() can
+	// deadlock if called concurrently with an already-in-progress Stop().
+	migrationStopCh    chan struct{}
+	migrationStoppedCh chan struct{}
 
 	// doctor is the jack.Doctor instance monitoring DB and encryption health.
 	// doctorOwned is true when Keeper created it (not provided via JackConfig).
@@ -621,9 +634,115 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 	// Start jack.Doctor health patients for DB latency and encryption.
 	s.startHealthPatients()
 
+	// Start per-bucket DEK derivation migration if needed.
+	s.startDEKMigration()
+
 	s.logger.Fields("defaultScheme", s.defaultScheme, "defaultNs", s.defaultNs).Info("store unlocked")
 	s.audit("unlock_database", "", "", "", true, 0)
 	return nil
+}
+
+// MigrationStatus reports the current state of the per-bucket DEK derivation
+// migration. Safe to call from any goroutine.
+func (s *Keeper) MigrationStatus() MigrationState {
+	return MigrationState(atomic.LoadInt32(&s.migrationState))
+}
+
+// startDEKMigration checks whether per-bucket DEK derivation migration is
+// needed and, if so, seeds the migrationState and starts the background looper.
+//
+// Called from UnlockDatabase after all buckets are seeded. Holds no locks —
+// the store is already unlocked at this point.
+func (s *Keeper) startDEKMigration() {
+	// Check the completion marker — O(1) metadata read.
+	done := false
+	_ = s.db.View(func(tx pkgstore.Tx) error {
+		b := tx.Bucket([]byte(metaBucket))
+		if b != nil && b.Get([]byte(metaBucketDEKDoneKey)) != nil {
+			done = true
+		}
+		return nil
+	})
+	if done {
+		atomic.StoreInt32(&s.migrationState, int32(MigrationNotNeeded))
+		s.logger.Debug("bucket DEK migration: already complete")
+		return
+	}
+
+	atomic.StoreInt32(&s.migrationState, int32(MigrationInProgress))
+
+	// Seed the old master-key-as-DEK into the envelope for every
+	// LevelPasswordOnly bucket so unmigrated records can still be decrypted.
+	seedOld := func(scheme, namespace string) {
+		mb, err := s.master.Bytes()
+		if err != nil {
+			return
+		}
+		buf := memguard.NewBufferFromBytes(mb) // copies and zeros mb
+		if buf.Size() > 0 {
+			s.envelope.HoldOld(scheme, namespace, buf)
+		}
+	}
+	seedOld(s.defaultScheme, s.defaultNs)
+	for _, policy := range s.schemeRegistry {
+		if policy.Level == LevelPasswordOnly {
+			seedOld(policy.Scheme, policy.Namespace)
+		}
+	}
+
+	batchSize := s.config.BucketDEKMigrationBatchSize
+	if batchSize <= 0 {
+		batchSize = defaultMigrationBatchSize
+	}
+	interval := s.config.BucketDEKMigrationInterval
+	if interval <= 0 {
+		interval = defaultMigrationInterval
+	}
+
+	// The watcher goroutine is the sole caller of looper.Stop(). Lock() must
+	// never call looper.Stop() directly — jack's Stop() can deadlock if called
+	// concurrently or while internal workers are still running.
+	//
+	// stopCh:    closed by Lock()/Close() to signal "please stop now"
+	// stoppedCh: closed by the watcher after looper.Stop() returns, so
+	//            Lock() can wait for the looper to fully drain before proceeding
+	// doneCh:    closed by the callback when migration completes naturally
+	doneCh := make(chan struct{})
+	stopCh := make(chan struct{})
+	stoppedCh := make(chan struct{})
+	s.migrationStopCh = stopCh
+	s.migrationStoppedCh = stoppedCh
+	looper := jack.NewLooper(
+		jack.Func(func() error {
+			complete, err := s.runMigrationBatch(batchSize)
+			if err != nil {
+				s.logger.Fields("err", err).Warn("bucket DEK migration batch failed")
+				return err
+			}
+			if complete {
+				atomic.StoreInt32(&s.migrationState, int32(MigrationDone))
+				s.logger.Info("bucket DEK migration complete")
+				close(doneCh)
+			}
+			return nil
+		}),
+		jack.WithLooperInterval(interval),
+		jack.WithLooperName("keeper:dek-migration"),
+	)
+	s.migrationLooper = looper
+	looper.Start()
+	// The watcher is the only goroutine that calls looper.Stop(). It waits for
+	// either natural completion (doneCh) or an external stop signal (stopCh),
+	// calls Stop(), then closes stoppedCh so Lock() can unblock.
+	go func() {
+		select {
+		case <-doneCh:
+		case <-stopCh:
+		}
+		looper.Stop()
+		close(stoppedCh)
+	}()
+	s.logger.Info("bucket DEK migration started")
 }
 
 // startPruneScheduler creates and starts a jack.Scheduler that periodically
@@ -703,14 +822,43 @@ func (s *Keeper) startHealthPatients() {
 // signing key, and stops all background goroutines.
 func (s *Keeper) Lock() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.locked {
+		s.mu.Unlock()
 		return nil
 	}
 	if s.autoLocker != nil {
 		s.autoLocker.Stop()
 		s.autoLocker = nil
 	}
+
+	// The migration looper's callback acquires s.mu.RLock() at the start of
+	// each batch. Calling looper.Stop() while holding s.mu.Lock() would
+	// deadlock: Stop() calls wg.Wait() for the looper goroutine to exit, but
+	// that goroutine is blocked trying to RLock s.mu.
+	//
+	// Solution: signal the watcher (close stopCh), release s.mu, wait for the
+	// watcher to confirm the looper has fully stopped (stoppedCh), then
+	// re-acquire s.mu to complete the rest of Lock(). Nil-ing the fields
+	// before releasing ensures any concurrent Lock() call sees no migration to
+	// stop and cannot interfere.
+	if s.migrationStopCh != nil {
+		stopCh := s.migrationStopCh
+		stoppedCh := s.migrationStoppedCh
+		s.migrationStopCh = nil
+		s.migrationStoppedCh = nil
+		s.migrationLooper = nil
+		s.mu.Unlock()
+		close(stopCh)
+		<-stoppedCh
+		s.mu.Lock()
+	} else if s.migrationLooper != nil {
+		// No watcher (migration completed naturally before Lock() was called).
+		// The looper is already stopped; just clear the field.
+		s.migrationLooper = nil
+	}
+
+	defer s.mu.Unlock()
+
 	if s.jackReaper != nil {
 		s.jackReaper.Stop()
 		s.jackReaper = nil

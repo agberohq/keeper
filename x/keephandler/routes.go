@@ -61,10 +61,14 @@ func (h *handler) status(w http.ResponseWriter, r *http.Request) {
 	if enabled {
 		locked = h.store.IsLocked()
 	}
-	h.enc(w, RouteStatus, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"enabled": enabled,
 		"locked":  locked,
-	})
+	}
+	if enabled {
+		resp["migration"] = h.store.MigrationStatus().String()
+	}
+	h.enc(w, RouteStatus, http.StatusOK, resp)
 }
 
 // list handles GET /keeper/keys.
