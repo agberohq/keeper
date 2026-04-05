@@ -10,9 +10,9 @@ import (
 // where no persistent file is required.
 //
 // Limitations:
-//   - No durable persistence across process restarts.
-//   - NextSequence values are not snapshotted across transactions.
-//   - ForEach iteration order is not guaranteed (map order).
+// No durable persistence across process restarts.
+// NextSequence values are not snapshotted across transactions.
+// ForEach iteration order is not guaranteed (map order).
 type MemStore struct {
 	mu   sync.RWMutex
 	data map[string]*memBucket // top-level buckets keyed by name
