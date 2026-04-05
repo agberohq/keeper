@@ -1547,6 +1547,24 @@ func (s *Keeper) RegisterScheme(name string, handler SchemeHandler) error {
 }
 
 // MoveCrossBucket moves a key between two buckets.
+// securityLevelRank returns the numeric security rank for a SecurityLevel.
+// Higher rank = higher security. Used for downgrade detection in
+// MoveCrossBucket and CopyCrossBucket.
+func securityLevelRank(l SecurityLevel) int {
+	switch l {
+	case LevelPasswordOnly:
+		return 1
+	case LevelAdminWrapped:
+		return 2
+	case LevelHSM:
+		return 3
+	case LevelRemote:
+		return 3
+	default:
+		return 0
+	}
+}
+
 func (s *Keeper) MoveCrossBucket(key, fromScheme, fromNS, toScheme, toNS string, confirmDowngrade bool) error {
 	fp, err := s.policyChain.GetPolicy(fromScheme, fromNS)
 	if err != nil {
@@ -1556,7 +1574,7 @@ func (s *Keeper) MoveCrossBucket(key, fromScheme, fromNS, toScheme, toNS string,
 	if err != nil {
 		return err
 	}
-	if fp.Level > tp.Level && !confirmDowngrade {
+	if securityLevelRank(fp.Level) > securityLevelRank(tp.Level) && !confirmDowngrade {
 		s.audit("security_downgrade_attempt", fromScheme, fromNS, key, false, 0)
 		return ErrSecurityDowngrade
 	}
@@ -1580,7 +1598,7 @@ func (s *Keeper) CopyCrossBucket(key, fromScheme, fromNS, toScheme, toNS string,
 	if err != nil {
 		return err
 	}
-	if fp.Level > tp.Level && !confirmDowngrade {
+	if securityLevelRank(fp.Level) > securityLevelRank(tp.Level) && !confirmDowngrade {
 		s.audit("security_downgrade_attempt", fromScheme, fromNS, key, false, 0)
 		return ErrSecurityDowngrade
 	}

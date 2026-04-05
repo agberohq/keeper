@@ -11,9 +11,9 @@ import (
 //
 // Every unlocked bucket has exactly one entry here. The DEK is sealed inside
 // a memguard Enclave which:
-//   - mlocks the memory so the OS never pages it to disk
-//   - mprotects the pages read-only when not in active use
-//   - zeros the memory on release
+// mlocks the memory so the OS never pages it to disk
+// mprotects the pages read-only when not in active use
+// zeros the memory on release
 //
 // Replaces the previous plain-map bucketKeys — Go's GC gave no guarantee
 // that key bytes would ever be zeroed.

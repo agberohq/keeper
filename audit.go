@@ -1,4 +1,3 @@
-// Package keeper — audit bridge connecting Keeper to pkg/audit.
 package keeper
 
 import (
@@ -30,11 +29,11 @@ func newAuditStore(db pkgstore.Store) *auditStore {
 	}
 }
 
-// setSigningKey rebuilds the inner audit.Store with the supplied HMAC key.
+// setSigningKey updates the active HMAC signing key on the inner audit.Store.
 // Pass nil to disable signing (called from Lock).
 // The caller is responsible for zeroing key after this call.
 func (a *auditStore) setSigningKey(key []byte) {
-	a.inner = pkgaudit.New(a.db, key)
+	a.inner.SetSigningKey(key)
 }
 
 // deriveAuditKey produces a 32-byte HMAC signing key from the master key.

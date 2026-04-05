@@ -1,6 +1,6 @@
 module github.com/agberohq/keeper
 
-go 1.25.8
+go 1.25.0
 
 require (
 	github.com/awnumar/memguard v0.23.0
@@ -21,6 +21,7 @@ require (
 	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
 	github.com/olekukonko/cat v0.0.0-20250911104152-50322a0618f6 // indirect
+	github.com/olekukonko/prompter v0.0.0-20260405071459-26600f6d335b // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect

@@ -17,7 +17,13 @@ func mustJSON(v interface{}) []byte {
 
 func generateUUID() string {
 	b := make([]byte, 16)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failure means the OS entropy source is broken.
+		// An all-zero UUID would silently overwrite other audit events in
+		// bbolt (same key = last-write-wins). The store cannot be trusted
+		// at all in this state — panic is the correct response.
+		panic(fmt.Sprintf("keeper: crypto/rand unavailable: %v", err))
+	}
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
