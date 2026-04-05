@@ -1,7 +1,8 @@
-package keephandler_test
+package keephandler
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,14 +15,11 @@ import (
 	"testing"
 
 	"github.com/agberohq/keeper"
-	"github.com/agberohq/keeper/x/keephandler"
 )
-
-// test server helpers
 
 // newTestServer creates an httptest.Server with a fresh unlocked keeper store
 // mounted at /keeper. The store is closed when the test ends.
-func newTestServer(t *testing.T, opts ...keephandler.Option) (*httptest.Server, *keeper.Keeper) {
+func newTestServer(t *testing.T, opts ...Option) (*httptest.Server, *keeper.Keeper) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 	store, err := keeper.New(keeper.Config{DBPath: dbPath})
@@ -35,7 +33,7 @@ func newTestServer(t *testing.T, opts ...keephandler.Option) (*httptest.Server, 
 	t.Cleanup(func() { store.Close() })
 
 	mux := http.NewServeMux()
-	keephandler.Mount(mux, store, opts...)
+	Mount(mux, store, opts...)
 	return httptest.NewServer(mux), store
 }
 
@@ -43,7 +41,7 @@ func newTestServer(t *testing.T, opts ...keephandler.Option) (*httptest.Server, 
 // "testpass" to write the verification hash, then locked again.
 // A brand-new keeper store with no verification hash accepts any passphrase on
 // first unlock, so we must establish the hash before testing wrong-passphrase rejection.
-func newLockedServer(t *testing.T, opts ...keephandler.Option) *httptest.Server {
+func newLockedServer(t *testing.T, opts ...Option) *httptest.Server {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "locked.db")
 	store, err := keeper.New(keeper.Config{DBPath: dbPath})
@@ -61,7 +59,7 @@ func newLockedServer(t *testing.T, opts ...keephandler.Option) *httptest.Server 
 	t.Cleanup(func() { store.Close() })
 
 	mux := http.NewServeMux()
-	keephandler.Mount(mux, store, opts...)
+	Mount(mux, store, opts...)
 	return httptest.NewServer(mux)
 }
 
@@ -229,8 +227,19 @@ func TestGet_Existing(t *testing.T) {
 		t.Fatalf("get: want 200, got %d", resp.StatusCode)
 	}
 	m := readJSON(t, resp)
-	if m["value"] != "mysecret" {
-		t.Errorf("value: want mysecret, got %v", m["value"])
+
+	// GET responses encode values as base64 to safely transport binary secrets.
+	// Verify the encoding field is present and decode before comparing.
+	if m["encoding"] != "base64" {
+		t.Errorf("encoding field: want \"base64\", got %v", m["encoding"])
+	}
+	rawVal, _ := m["value"].(string)
+	decoded, err := base64.StdEncoding.DecodeString(rawVal)
+	if err != nil {
+		t.Fatalf("value is not valid base64: %v", err)
+	}
+	if string(decoded) != "mysecret" {
+		t.Errorf("value: want \"mysecret\", got %q", decoded)
 	}
 }
 
@@ -274,7 +283,7 @@ func TestSet_Base64(t *testing.T) {
 	srv, _ := newTestServer(t)
 	defer srv.Close()
 
-	// "hello" → aGVsbG8=
+	// "hello" → aGVsbG8
 	resp := do(t, srv, "POST", "/keeper/keys", `{"key":"b64key","value":"aGVsbG8=","b64":true}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("set b64: want 200, got %d", resp.StatusCode)
@@ -438,7 +447,7 @@ func TestBackup_WhenLocked(t *testing.T) {
 // custom prefix
 
 func TestMount_CustomPrefix(t *testing.T) {
-	srv, _ := newTestServer(t, keephandler.WithPrefix("/api/v1/secrets"))
+	srv, _ := newTestServer(t, WithPrefix("/api/v1/secrets"))
 	defer srv.Close()
 
 	resp, _ := http.Get(srv.URL + "/api/v1/secrets/status")
@@ -450,7 +459,7 @@ func TestMount_CustomPrefix(t *testing.T) {
 // WithRoutes extension
 
 func TestMount_WithRoutes(t *testing.T) {
-	srv, _ := newTestServer(t, keephandler.WithRoutes(func(m *http.ServeMux) {
+	srv, _ := newTestServer(t, WithRoutes(func(m *http.ServeMux) {
 		m.HandleFunc("GET /keeper/custom", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusTeapot)
 		})
@@ -467,7 +476,7 @@ func TestMount_WithRoutes(t *testing.T) {
 
 func TestMount_NilStore(t *testing.T) {
 	mux := http.NewServeMux()
-	keephandler.Mount(mux, nil)
+	Mount(mux, nil)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -503,8 +512,14 @@ func TestRoundTrip_SetGetDelete(t *testing.T) {
 
 		getResp := do(t, srv, "GET", "/keeper/keys/"+key, "")
 		m := readJSON(t, getResp)
-		if m["value"] != val {
-			t.Errorf("get %s: want %s, got %v", key, val, m["value"])
+		// GET responses encode values as base64 — decode before comparing.
+		rawVal, _ := m["value"].(string)
+		decoded, err := base64.StdEncoding.DecodeString(rawVal)
+		if err != nil {
+			t.Fatalf("get %s: value not valid base64: %v", key, err)
+		}
+		if string(decoded) != val {
+			t.Errorf("get %s: want %s, got %q", key, val, decoded)
 		}
 
 		delResp := do(t, srv, "DELETE", "/keeper/keys/"+key, "")
@@ -520,15 +535,15 @@ func TestRoundTrip_SetGetDelete(t *testing.T) {
 // lets the request proceed and the real handler response is returned.
 func TestHook_Before_Allow(t *testing.T) {
 	var called atomic.Bool
-	hook := keephandler.Hook{
-		Route: keephandler.RouteGet,
+	hook := Hook{
+		Route: RouteGet,
 		Before: func(w http.ResponseWriter, r *http.Request) (bool, error) {
 			called.Store(true)
 			return true, nil // allow
 		},
 	}
 
-	srv, _ := newTestServer(t, keephandler.WithHooks(hook))
+	srv, _ := newTestServer(t, WithHooks(hook))
 	defer srv.Close()
 
 	do(t, srv, "POST", "/keeper/keys", `{"key":"hk","value":"hv"}`)
@@ -545,15 +560,15 @@ func TestHook_Before_Allow(t *testing.T) {
 // TestHook_Before_Deny verifies that a Before hook returning (false, nil)
 // aborts the request with whatever the hook wrote — here 403.
 func TestHook_Before_Deny(t *testing.T) {
-	hook := keephandler.Hook{
-		Route: keephandler.RouteGet,
+	hook := Hook{
+		Route: RouteGet,
 		Before: func(w http.ResponseWriter, r *http.Request) (bool, error) {
 			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
 			return false, nil
 		},
 	}
 
-	srv, _ := newTestServer(t, keephandler.WithHooks(hook))
+	srv, _ := newTestServer(t, WithHooks(hook))
 	defer srv.Close()
 
 	do(t, srv, "POST", "/keeper/keys", `{"key":"denied","value":"secret"}`)
@@ -567,14 +582,14 @@ func TestHook_Before_Deny(t *testing.T) {
 // TestHook_Before_Error verifies that a Before hook returning (false, err)
 // causes a 500 JSON response without the hook having written anything.
 func TestHook_Before_Error(t *testing.T) {
-	hook := keephandler.Hook{
-		Route: keephandler.RouteList,
+	hook := Hook{
+		Route: RouteList,
 		Before: func(w http.ResponseWriter, r *http.Request) (bool, error) {
 			return false, fmt.Errorf("auth service unavailable")
 		},
 	}
 
-	srv, _ := newTestServer(t, keephandler.WithHooks(hook))
+	srv, _ := newTestServer(t, WithHooks(hook))
 	defer srv.Close()
 
 	resp := do(t, srv, "GET", "/keeper/keys", "")
@@ -591,15 +606,15 @@ func TestHook_Before_Error(t *testing.T) {
 // intercept requests to other routes (e.g. list).
 func TestHook_Before_OnlyTargetRoute(t *testing.T) {
 	var getCalled atomic.Bool
-	hook := keephandler.Hook{
-		Route: keephandler.RouteGet,
+	hook := Hook{
+		Route: RouteGet,
 		Before: func(w http.ResponseWriter, r *http.Request) (bool, error) {
 			getCalled.Store(true)
 			return true, nil
 		},
 	}
 
-	srv, _ := newTestServer(t, keephandler.WithHooks(hook))
+	srv, _ := newTestServer(t, WithHooks(hook))
 	defer srv.Close()
 
 	// list should not trigger the get hook
@@ -618,8 +633,8 @@ func TestHook_Before_OnlyTargetRoute(t *testing.T) {
 // code when CaptureBody is false.
 func TestHook_After_StatusOnly(t *testing.T) {
 	var capturedStatus atomic.Int32
-	hook := keephandler.Hook{
-		Route:       keephandler.RouteSet,
+	hook := Hook{
+		Route:       RouteSet,
 		CaptureBody: false,
 		After: func(r *http.Request, status int, body []byte) {
 			capturedStatus.Store(int32(status))
@@ -629,7 +644,7 @@ func TestHook_After_StatusOnly(t *testing.T) {
 		},
 	}
 
-	srv, _ := newTestServer(t, keephandler.WithHooks(hook))
+	srv, _ := newTestServer(t, WithHooks(hook))
 	defer srv.Close()
 
 	resp := do(t, srv, "POST", "/keeper/keys", `{"key":"ak","value":"av"}`)
@@ -649,8 +664,8 @@ func TestHook_After_CaptureBody(t *testing.T) {
 	var capturedStatus atomic.Int32
 	var capturedBody atomic.Value // stores []byte
 
-	hook := keephandler.Hook{
-		Route:       keephandler.RouteGet,
+	hook := Hook{
+		Route:       RouteGet,
 		CaptureBody: true,
 		After: func(r *http.Request, status int, body []byte) {
 			capturedStatus.Store(int32(status))
@@ -660,7 +675,7 @@ func TestHook_After_CaptureBody(t *testing.T) {
 		},
 	}
 
-	srv, _ := newTestServer(t, keephandler.WithHooks(hook))
+	srv, _ := newTestServer(t, WithHooks(hook))
 	defer srv.Close()
 
 	do(t, srv, "POST", "/keeper/keys", `{"key":"ck","value":"cv"}`)
@@ -670,18 +685,20 @@ func TestHook_After_CaptureBody(t *testing.T) {
 		t.Fatalf("get: want 200, got %d", resp.StatusCode)
 	}
 	// Client should receive the full body.
+	// Values are base64-encoded in GET responses — check for the encoded form.
 	clientBody, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if !strings.Contains(string(clientBody), "cv") {
-		t.Errorf("client body missing value: %s", clientBody)
+	wantB64 := base64.StdEncoding.EncodeToString([]byte("cv"))
+	if !strings.Contains(string(clientBody), wantB64) {
+		t.Errorf("client body missing base64 value %q: %s", wantB64, clientBody)
 	}
 	// AfterFunc should have received the same body.
 	if got := int(capturedStatus.Load()); got != http.StatusOK {
 		t.Errorf("After status: want 200, got %d", got)
 	}
 	b, _ := capturedBody.Load().([]byte)
-	if !strings.Contains(string(b), "cv") {
-		t.Errorf("After body missing value: %s", b)
+	if !strings.Contains(string(b), wantB64) {
+		t.Errorf("After body missing base64 value %q: %s", wantB64, b)
 	}
 }
 
@@ -700,7 +717,7 @@ func TestWithEncoder_CustomEnvelope(t *testing.T) {
 		})
 	}
 
-	srv, _ := newTestServer(t, keephandler.WithEncoder(enc))
+	srv, _ := newTestServer(t, WithEncoder(enc))
 	defer srv.Close()
 
 	resp := do(t, srv, "GET", "/keeper/status", "")
@@ -709,8 +726,8 @@ func TestWithEncoder_CustomEnvelope(t *testing.T) {
 	if m["ok"] != true {
 		t.Errorf("envelope ok: want true, got %v", m["ok"])
 	}
-	if m["route"] != keephandler.RouteStatus {
-		t.Errorf("envelope route: want %q, got %v", keephandler.RouteStatus, m["route"])
+	if m["route"] != RouteStatus {
+		t.Errorf("envelope route: want %q, got %v", RouteStatus, m["route"])
 	}
 	if _, hasData := m["data"]; !hasData {
 		t.Error("envelope missing data field")
@@ -728,7 +745,7 @@ func TestWithEncoder_ErrorShape(t *testing.T) {
 		json.NewEncoder(w).Encode(data)
 	}
 
-	srv := newLockedServer(t, keephandler.WithEncoder(enc))
+	srv := newLockedServer(t, WithEncoder(enc))
 	defer srv.Close()
 
 	resp := do(t, srv, "GET", "/keeper/keys", "")
@@ -753,7 +770,7 @@ func TestWithGuard_Allow(t *testing.T) {
 		return true
 	}
 
-	srv, _ := newTestServer(t, keephandler.WithGuard(guard))
+	srv, _ := newTestServer(t, WithGuard(guard))
 	defer srv.Close()
 
 	resp := do(t, srv, "GET", "/keeper/keys", "")
@@ -773,7 +790,7 @@ func TestWithGuard_Deny(t *testing.T) {
 		return false
 	}
 
-	srv, _ := newTestServer(t, keephandler.WithGuard(guard))
+	srv, _ := newTestServer(t, WithGuard(guard))
 	defer srv.Close()
 
 	resp := do(t, srv, "GET", "/keeper/keys", "")
@@ -791,14 +808,14 @@ func TestWithGuard_RouteAware(t *testing.T) {
 		return true
 	}
 
-	srv, _ := newTestServer(t, keephandler.WithGuard(guard))
+	srv, _ := newTestServer(t, WithGuard(guard))
 	defer srv.Close()
 
 	do(t, srv, "GET", "/keeper/keys", "")
 	do(t, srv, "POST", "/keeper/keys", `{"key":"gk","value":"gv"}`)
 	do(t, srv, "GET", "/keeper/keys/gk", "")
 
-	want := []string{keephandler.RouteList, keephandler.RouteSet, keephandler.RouteGet}
+	want := []string{RouteList, RouteSet, RouteGet}
 	for i, w := range want {
 		if i >= len(seenRoutes) {
 			t.Fatalf("guard called only %d times, want %d", len(seenRoutes), len(want))
@@ -818,7 +835,7 @@ func TestWithGuard_NotCalledOnStatus(t *testing.T) {
 		return true
 	}
 
-	srv, _ := newTestServer(t, keephandler.WithGuard(guard))
+	srv, _ := newTestServer(t, WithGuard(guard))
 	defer srv.Close()
 
 	resp := do(t, srv, "GET", "/keeper/status", "")
@@ -836,8 +853,8 @@ func TestWithGuard_NotCalledOnStatus(t *testing.T) {
 func TestWithGuard_AndHook_Composition(t *testing.T) {
 	var hookFired, guardFired atomic.Bool
 
-	hook := keephandler.Hook{
-		Route: keephandler.RouteList,
+	hook := Hook{
+		Route: RouteList,
 		Before: func(w http.ResponseWriter, r *http.Request) (bool, error) {
 			hookFired.Store(true)
 			return true, nil
@@ -849,8 +866,8 @@ func TestWithGuard_AndHook_Composition(t *testing.T) {
 	}
 
 	srv, _ := newTestServer(t,
-		keephandler.WithHooks(hook),
-		keephandler.WithGuard(guard),
+		WithHooks(hook),
+		WithGuard(guard),
 	)
 	defer srv.Close()
 

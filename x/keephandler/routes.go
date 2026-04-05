@@ -36,6 +36,7 @@ func (h *handler) unlock(w http.ResponseWriter, r *http.Request) {
 		h.enc(w, RouteUnlock, http.StatusUnauthorized, errData("invalid passphrase"))
 		return
 	}
+	noStore(w)
 	h.enc(w, RouteUnlock, http.StatusOK, map[string]string{"status": "unlocked"})
 }
 
@@ -102,7 +103,14 @@ func (h *handler) get(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	h.enc(w, RouteGet, http.StatusOK, map[string]string{"key": key, "value": string(val)})
+	noStore(w)
+	// Values are base64-encoded to safely transport binary secrets without
+	// UTF-8 corruption. Clients must base64-decode the value field.
+	h.enc(w, RouteGet, http.StatusOK, map[string]any{
+		"key":      key,
+		"value":    base64.StdEncoding.EncodeToString(val),
+		"encoding": "base64",
+	})
 }
 
 // setRequest is the JSON body for POST /keeper/keys.
@@ -179,6 +187,7 @@ func (h *handler) set(w http.ResponseWriter, r *http.Request) {
 		h.enc(w, RouteSet, http.StatusInternalServerError, errData(err.Error()))
 		return
 	}
+	noStore(w)
 	h.enc(w, RouteSet, http.StatusOK, map[string]any{
 		"key":   key,
 		"bytes": len(data),
@@ -225,6 +234,7 @@ func (h *handler) rotate(w http.ResponseWriter, r *http.Request) {
 		h.enc(w, RouteRotate, http.StatusInternalServerError, errData(err.Error()))
 		return
 	}
+	noStore(w)
 	h.enc(w, RouteRotate, http.StatusOK, map[string]string{"status": "rotated"})
 }
 
@@ -246,6 +256,7 @@ func (h *handler) rotateSalt(w http.ResponseWriter, r *http.Request) {
 		h.enc(w, RouteRotateSalt, http.StatusInternalServerError, errData(err.Error()))
 		return
 	}
+	noStore(w)
 	h.enc(w, RouteRotateSalt, http.StatusOK, map[string]string{"status": "salt rotated"})
 }
 
@@ -267,11 +278,25 @@ func (h *handler) backup(w http.ResponseWriter, r *http.Request) {
 
 // helpers
 
+// noStore writes Cache-Control and Pragma headers that instruct clients and
+// intermediaries never to cache the response. Must be called before h.enc
+// because h.enc calls WriteHeader which locks headers.
+func noStore(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store, no-cache")
+	w.Header().Set("Pragma", "no-cache")
+}
+
 // extractFieldBytes decodes a single named string field from a JSON request
-// body directly into []byte. This avoids storing the field value in an
-// immutable Go string whose backing array cannot be zeroed.
+// body into []byte.
 //
-// The JSON body is decoded into a raw map; only the named field is extracted.
+// Limitation: json.Unmarshal must first decode the field into a Go string
+// before we can copy it to []byte. The string's backing array is an immutable
+// Go allocation that cannot be zeroed and remains on the heap until GC. This
+// means the passphrase briefly exists as a Go string. A full fix requires a
+// custom JSON string unquoter that writes directly into []byte; that is
+// tracked as a follow-on. The []byte copy returned here is what callers
+// zero via wipeBytes — that part is correct.
+//
 // Returns (nil, false) on any parse error or absent field.
 func extractFieldBytes(r *http.Request, field string) ([]byte, bool) {
 	var raw map[string]json.RawMessage
@@ -286,8 +311,9 @@ func extractFieldBytes(r *http.Request, field string) ([]byte, bool) {
 	if err := json.Unmarshal(v, &s); err != nil {
 		return nil, false
 	}
-	// Convert to []byte immediately; the string s is now unreachable and
-	// eligible for GC. The []byte copy is what we zero via wipeBytes.
+	// Convert to []byte immediately. The string s backing array cannot be
+	// zeroed (Go limitation — see function comment), but the []byte copy
+	// returned here is what callers zero via wipeBytes.
 	return []byte(s), true
 }
 
