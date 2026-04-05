@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	"github.com/agberohq/keeper"
-	"github.com/agberohq/keeper/pkg/prompter"
 	"github.com/agberohq/keeper/x/keepcmd"
+	"github.com/olekukonko/prompter"
 )
 
 // replSession holds state for an interactive session.
@@ -130,7 +130,7 @@ func (s *replSession) dispatch(line string) (exit bool, err error) {
 			return false, nil
 		}
 		key := args[0]
-		secret, e := prompter.ReadSecret("Value for " + key)
+		secret, e := prompter.NewSecret("Value for "+key, prompter.WithRequired(true)).Run()
 		if e != nil {
 			return false, e
 		}

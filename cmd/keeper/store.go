@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/agberohq/keeper"
-	"github.com/agberohq/keeper/pkg/prompter"
+	"github.com/olekukonko/prompter"
 )
 
 // initStore handles the new-database flow:
@@ -29,11 +29,9 @@ func initStore(dbPath string) (*keeper.Keeper, error) {
 	}
 
 	// Step 2 — prompt for initial passphrase.
-	pass, err := prompter.NewInput("Passphrase (new)",
-		prompter.WithRequired(true, "passphrase is required"),
-		prompter.WithConfirm(),
-		prompter.WithConfirmMsg("Confirm passphrase"),
-	).Run()
+	pass, err := prompter.NewSecret("Passphrase (new)",
+		prompter.WithRequired(true),
+	).WithConfirmation("Confirm passphrase").Run()
 	if err != nil {
 		return nil, fmt.Errorf("passphrase: %w", err)
 	}
@@ -90,19 +88,22 @@ func openStoreLocked(dbPath string) (*keeper.Keeper, error) {
 // The caller must call result.Zero() when done.
 func resolvePassphrase() (*prompter.Result, error) {
 	if env := os.Getenv(envPassphrase); env != "" {
+		// Unset immediately so child processes do not inherit the passphrase.
+		// NOTE: the Go string backing array for env cannot be zeroed — env vars
+		// are not suitable for high-security deployments. Prefer the interactive
+		// prompt or a secrets file passed via file descriptor instead.
+		os.Unsetenv(envPassphrase) //nolint:errcheck
 		return prompter.NewResult([]byte(env)), nil
 	}
-	return prompter.NewInput("Passphrase",
-		prompter.WithRequired(true, "passphrase is required"),
+	return prompter.NewSecret("Passphrase",
+		prompter.WithRequired(true),
 	).Run()
 }
 
 // resolveNewPassphrase prompts for a new passphrase with confirmation.
 // Never reads from env — a new passphrase must always be entered interactively.
 func resolveNewPassphrase() (*prompter.Result, error) {
-	return prompter.NewInput("New passphrase",
-		prompter.WithRequired(true, "passphrase is required"),
-		prompter.WithConfirm(),
-		prompter.WithConfirmMsg("Confirm new passphrase"),
-	).Run()
+	return prompter.NewSecret("New passphrase",
+		prompter.WithRequired(true),
+	).WithConfirmation("Confirm new passphrase").Run()
 }

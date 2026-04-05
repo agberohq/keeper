@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/integrii/flaggy"
+	"github.com/olekukonko/prompter"
 	"golang.org/x/term"
 )
 
@@ -99,9 +100,15 @@ func main() {
 	case setCmd.Used:
 		must(runSubcommand(res, "set", setKey, setValue, setFile, setB64))
 	case deleteCmd.Used:
-		if !deleteForce && !confirmDelete(deleteKey) {
-			fmt.Println("aborted")
-			return
+		if !deleteForce {
+			ok, err := prompter.Confirm(fmt.Sprintf("Delete %q? This cannot be undone.", deleteKey))
+			if err != nil {
+				fatalf("confirm: %v", err)
+			}
+			if !ok {
+				fmt.Println("aborted")
+				return
+			}
 		}
 		must(runSubcommand(res, "delete", deleteKey, "", "", false))
 	case rotateCmd.Used:
@@ -123,14 +130,6 @@ func anyUsed(cmds ...*flaggy.Subcommand) bool {
 		}
 	}
 	return false
-}
-
-// confirmDelete prompts for y/N confirmation before a destructive delete.
-func confirmDelete(key string) bool {
-	fmt.Printf("Delete %q? This cannot be undone. [y/N] ", key)
-	var answer string
-	fmt.Scanln(&answer)
-	return answer == "y" || answer == "Y"
 }
 
 func must(err error) {
