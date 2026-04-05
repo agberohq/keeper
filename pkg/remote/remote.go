@@ -207,12 +207,17 @@ func (p *Provider) Ping(ctx context.Context) error {
 // buildRequest renders the request body. When tmpl is empty the raw base64
 // of payload is used as the body. Otherwise the template is rendered with
 // a single field named fieldName set to the base64-encoded payload.
+// Returns an error when tmpl is non-empty but does not contain the placeholder
+// — this prevents silently sending the raw template string to the KMS.
 func (p *Provider) buildRequest(payload []byte, tmpl, fieldName string) ([]byte, error) {
 	encoded := base64.StdEncoding.EncodeToString(payload)
 	if tmpl == "" {
 		return []byte(encoded), nil
 	}
 	replaced := strings.ReplaceAll(tmpl, "{{."+fieldName+"}}", encoded)
+	if replaced == tmpl {
+		return nil, fmt.Errorf("remote: template does not contain {{.%s}} placeholder", fieldName)
+	}
 	return []byte(replaced), nil
 }
 
