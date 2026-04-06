@@ -433,14 +433,14 @@ func TestRename(t *testing.T) {
 func TestCompareAndSwap(t *testing.T) {
 	store := newUnlockedStore(t)
 	store.Set("k", []byte("initial"))
-	if err := store.CompareAndSwap("k", "initial", "updated"); err != nil {
+	if err := store.CompareAndSwap("k", []byte("initial"), []byte("updated")); err != nil {
 		t.Fatalf("CAS: %v", err)
 	}
 	v, _ := store.Get("k")
 	if string(v) != "updated" {
 		t.Errorf("after CAS: %q", v)
 	}
-	if err := store.CompareAndSwap("k", "wrong", "x"); err != ErrCASConflict {
+	if err := store.CompareAndSwap("k", []byte("wrong"), []byte("x")); !errors.Is(err, ErrCASConflict) {
 		t.Errorf("bad old val: want ErrCASConflict, got %v", err)
 	}
 }

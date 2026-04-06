@@ -284,6 +284,16 @@ func (s *Keeper) CreateBucket(scheme, namespace string, level SecurityLevel, cre
 		return err
 	}
 
+	// For LevelPasswordOnly, schemeRegistry is not populated by unlockBucketPasswordOnly
+	// (which only seeds the envelope). Populate it explicitly here so that
+	// RegisterBucketHandler and other registry lookups work immediately after
+	// CreateBucket returns, consistent with LevelAdminWrapped and LevelHSM.
+	if level == LevelPasswordOnly {
+		s.registryMu.Lock()
+		s.schemeRegistry[fmt.Sprintf("%s:%s", scheme, namespace)] = policy
+		s.registryMu.Unlock()
+	}
+
 	// Seed the Envelope immediately for LevelPasswordOnly buckets created
 	// while the store is already unlocked.
 	if !s.locked && level == LevelPasswordOnly {
@@ -322,6 +332,26 @@ func (s *Keeper) EnsureBucket(key string) error {
 		return nil
 	}
 	return err
+}
+
+// RegisterBucketHandler attaches a SchemeHandler to an existing bucket policy
+// in the registry. The handler is called for every Pre*/Post* operation on
+// that bucket. It is excluded from serialisation — callers must register it
+// after Open (and after UnlockDatabase for LevelAdminWrapped buckets).
+// Returns ErrPolicyNotFound if the bucket does not exist.
+func (s *Keeper) RegisterBucketHandler(scheme, namespace string, handler SchemeHandler) error {
+	if handler == nil {
+		return nil
+	}
+	key := scheme + ":" + namespace
+	s.registryMu.Lock()
+	defer s.registryMu.Unlock()
+	policy, ok := s.schemeRegistry[key]
+	if !ok {
+		return ErrPolicyNotFound
+	}
+	policy.Handler = handler
+	return nil
 }
 
 // RegisterHSMProvider attaches an HSMProvider to an existing LevelHSM or LevelRemote

@@ -471,9 +471,9 @@ func (s *Keeper) CompareAndSwapNamespaced(namespace, key string, oldValue, newVa
 	return s.CompareAndSwapNamespacedFull(s.defaultScheme, namespace, key, oldValue, newValue)
 }
 
-func (s *Keeper) CompareAndSwap(key, oldValue, newValue string) error {
+func (s *Keeper) CompareAndSwap(key string, oldValue, newValue []byte) error {
 	scheme, namespace, localKey := parseKeyExtended(key)
-	return s.CompareAndSwapNamespacedFull(scheme, namespace, localKey, []byte(oldValue), []byte(newValue))
+	return s.CompareAndSwapNamespacedFull(scheme, namespace, localKey, oldValue, newValue)
 }
 
 func (s *Keeper) DeleteNamespace(namespace string) error {
