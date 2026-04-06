@@ -199,17 +199,17 @@ type EncryptedMetadata struct {
 
 // SaltEntry records one generation of the KDF salt.
 type SaltEntry struct {
-	Version   int       `json:"v"`
-	Salt      []byte    `json:"s"`
-	CreatedAt time.Time `json:"ca"`
+	Version   int       `json:"v"    msgpack:"v"`
+	Salt      []byte    `json:"s"    msgpack:"s"`
+	CreatedAt time.Time `json:"ca"   msgpack:"ca"`
 }
 
 // SaltStore is the versioned salt container stored under metaSaltKey.
 // CurrentVersion indexes into Entries. Old entries are retained as an
 // audit trail and for crash-recovery during salt rotation.
 type SaltStore struct {
-	CurrentVersion int         `json:"current"`
-	Entries        []SaltEntry `json:"entries"`
+	CurrentVersion int         `json:"current"  msgpack:"current"`
+	Entries        []SaltEntry `json:"entries"  msgpack:"entries"`
 }
 
 // RotationWAL tracks the state of an in-progress key rotation.
@@ -220,13 +220,13 @@ type SaltStore struct {
 // key using XChaCha20-Poly1305. It is the only safe way to carry the old
 // key across a crash boundary without storing it in plaintext.
 type RotationWAL struct {
-	Status        string    `json:"status"`
-	OldKeyHash    []byte    `json:"old_hash"`
-	NewKeyHash    []byte    `json:"new_hash"`
-	StartedAt     time.Time `json:"started"`
-	LastKey       string    `json:"last_key"`
-	SaltVersion   int       `json:"salt_ver"`
-	WrappedOldKey []byte    `json:"wrapped_old_key"`
+	Status        string    `json:"status"          msgpack:"status"`
+	OldKeyHash    []byte    `json:"old_hash"        msgpack:"old_hash"`
+	NewKeyHash    []byte    `json:"new_hash"        msgpack:"new_hash"`
+	StartedAt     time.Time `json:"started"         msgpack:"started"`
+	LastKey       string    `json:"last_key"        msgpack:"last_key"`
+	SaltVersion   int       `json:"salt_ver"        msgpack:"salt_ver"`
+	WrappedOldKey []byte    `json:"wrapped_old_key" msgpack:"wrapped_old_key"`
 }
 
 // NamespaceStats holds aggregate statistics for one namespace.

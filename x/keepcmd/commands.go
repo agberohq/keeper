@@ -132,6 +132,15 @@ func (c *Commands) Set(key, value string, opts SetOptions) error {
 	}
 	defer cleanup()
 
+	// Ensure the target bucket exists before writing. EnsureBucket is
+	// idempotent — it creates the bucket if absent and ignores
+	// ErrPolicyImmutable when it already exists. This lets the CLI write
+	// to any scheme/namespace (ss://, vault://, etc.) without requiring
+	// an explicit CreateBucket call first.
+	if bErr := store.EnsureBucket(key); bErr != nil {
+		return fmt.Errorf("ensure bucket for %q: %w", key, bErr)
+	}
+
 	if err := store.Set(key, data); err != nil {
 		return fmt.Errorf("set %q: %w", key, err)
 	}

@@ -43,6 +43,50 @@ func unmarshalEncryptedMetadata(data []byte, m *EncryptedMetadata) error {
 	return msgpack.Unmarshal(data, m)
 }
 
+// marshalPolicy encodes a BucketSecurityPolicy using msgpack.
+func marshalPolicy(p *BucketSecurityPolicy) ([]byte, error) {
+	return msgpack.Marshal(p)
+}
+
+// unmarshalPolicy decodes a BucketSecurityPolicy.
+// New records are msgpack; legacy records written before this change are JSON.
+// Detection: JSON objects always start with '{' (0x7b); msgpack fixmap/map
+// headers are in the range 0x80–0x8f, 0xde, or 0xdf — never 0x7b.
+func unmarshalPolicy(data []byte, p *BucketSecurityPolicy) error {
+	if len(data) > 0 && data[0] == '{' {
+		return json.Unmarshal(data, p)
+	}
+	return msgpack.Unmarshal(data, p)
+}
+
+// marshalWAL encodes a RotationWAL using msgpack.
+func marshalWAL(w *RotationWAL) ([]byte, error) {
+	return msgpack.Marshal(w)
+}
+
+// unmarshalWAL decodes a RotationWAL.
+// Applies the same JSON-fallback detection as unmarshalPolicy.
+func unmarshalWAL(data []byte, w *RotationWAL) error {
+	if len(data) > 0 && data[0] == '{' {
+		return json.Unmarshal(data, w)
+	}
+	return msgpack.Unmarshal(data, w)
+}
+
+// marshalSaltStore encodes a SaltStore using msgpack.
+func marshalSaltStore(s *SaltStore) ([]byte, error) {
+	return msgpack.Marshal(s)
+}
+
+// unmarshalSaltStore decodes a SaltStore.
+// Applies the same JSON-fallback detection as unmarshalPolicy.
+func unmarshalSaltStore(data []byte, s *SaltStore) error {
+	if len(data) > 0 && data[0] == '{' {
+		return json.Unmarshal(data, s)
+	}
+	return msgpack.Unmarshal(data, s)
+}
+
 func (s *Keeper) initBuckets() error {
 	return s.db.Update(func(tx pkgstore.Tx) error {
 		for _, name := range []string{metaBucket, policyBucket, auditBucketRoot} {
@@ -580,7 +624,7 @@ func (s *Keeper) reencryptRecord(scheme, namespace, key string, effectiveNew, ef
 }
 
 func (s *Keeper) writeRotationWAL(wal *RotationWAL) error {
-	data, err := json.Marshal(wal)
+	data, err := marshalWAL(wal)
 	if err != nil {
 		return err
 	}
@@ -604,7 +648,7 @@ func (s *Keeper) readRotationWAL() (*RotationWAL, error) {
 		if data == nil {
 			return stdErrors.New("rotation WAL not found")
 		}
-		return json.Unmarshal(data, &wal)
+		return unmarshalWAL(data, &wal)
 	})
 	return &wal, err
 }
@@ -733,10 +777,17 @@ func (s *Keeper) loadSaltStore() (*SaltStore, error) {
 	if raw == nil {
 		return nil, nil
 	}
-	// Detect legacy format: a bare 32-byte salt stored as raw bytes.
-	// A JSON SaltStore always starts with '{'.
-	if len(raw) > 0 && raw[0] != '{' {
-		// Migrate: wrap the bare salt in a versioned store.
+	// Three possible formats:
+	// Legacy bare salt: exactly masterKeyLen random bytes (pre-versioned format).
+	//      A versioned SaltStore — even the smallest possible — is always larger
+	//      than masterKeyLen bytes, so length is the reliable discriminator.
+	// JSON SaltStore (written before the msgpack migration): starts with '{'.
+	// Msgpack SaltStore (current format): starts with a msgpack map header.
+	//
+	// We check length first so that random salt bytes that happen to start with
+	// '{' or a msgpack header byte are never misidentified as structured records.
+	if len(raw) == masterKeyLen {
+		// Legacy bare salt — wrap it in a versioned store and rewrite.
 		salt := append([]byte(nil), raw...)
 		store := &SaltStore{
 			CurrentVersion: 1,
@@ -750,14 +801,14 @@ func (s *Keeper) loadSaltStore() (*SaltStore, error) {
 		return store, nil
 	}
 	var store SaltStore
-	if err := json.Unmarshal(raw, &store); err != nil {
+	if err := unmarshalSaltStore(raw, &store); err != nil {
 		return nil, fmt.Errorf("failed to decode salt store: %w", err)
 	}
 	return &store, nil
 }
 
 func (s *Keeper) saveSaltStore(store *SaltStore) error {
-	data, err := json.Marshal(store)
+	data, err := marshalSaltStore(store)
 	if err != nil {
 		return err
 	}
@@ -868,7 +919,7 @@ func (s *Keeper) savePolicy(policy *BucketSecurityPolicy) error {
 			return err
 		}
 		key := fmt.Sprintf("%s:%s", policy.Scheme, policy.Namespace)
-		data, err := json.Marshal(policy)
+		data, err := marshalPolicy(policy)
 		if err != nil {
 			return err
 		}
@@ -902,7 +953,7 @@ func (s *Keeper) loadPolicies() error {
 				return nil
 			}
 			var policy BucketSecurityPolicy
-			if err := json.Unmarshal(v, &policy); err != nil {
+			if err := unmarshalPolicy(v, &policy); err != nil {
 				return err
 			}
 			s.registryMu.Lock()
@@ -956,7 +1007,7 @@ func (s *Keeper) loadPolicy(scheme, namespace string) (*BucketSecurityPolicy, er
 			}
 		}
 
-		return json.Unmarshal(data, &policy)
+		return unmarshalPolicy(data, &policy)
 	})
 	if err != nil {
 		return nil, err
@@ -992,6 +1043,57 @@ func (s *Keeper) upgradePolicyHMACs() error {
 			}
 			tag := computePolicyHMAC(s.policyKey, v)
 			return policies.Put([]byte(key+policyHMACSuffix), []byte(tag))
+		})
+	})
+}
+
+// upgradePolicyEncoding re-encodes any JSON-encoded policy records to msgpack
+// and recomputes their SHA-256 hash and HMAC tags against the new bytes.
+// Called from UnlockDatabase after upgradePolicyHMACs. Crash-safe: if the
+// process dies mid-upgrade, any remaining JSON-encoded records are detected and
+// migrated on the next UnlockDatabase call. Already-migrated records (first
+// byte != '{') are skipped in O(1).
+func (s *Keeper) upgradePolicyEncoding() error {
+	return s.db.Update(func(tx pkgstore.Tx) error {
+		policies := tx.Bucket([]byte(policyBucket))
+		if policies == nil {
+			return nil
+		}
+		return policies.ForEach(func(k, v []byte) error {
+			key := string(k)
+			if isPolicyHashKey(key) {
+				return nil
+			}
+			// Already msgpack — nothing to do.
+			if len(v) == 0 || v[0] != '{' {
+				return nil
+			}
+			// Decode the JSON record.
+			var policy BucketSecurityPolicy
+			if err := json.Unmarshal(v, &policy); err != nil {
+				return fmt.Errorf("upgradePolicyEncoding: decode %s: %w", key, err)
+			}
+			// Re-encode as msgpack.
+			newData, err := marshalPolicy(&policy)
+			if err != nil {
+				return fmt.Errorf("upgradePolicyEncoding: encode %s: %w", key, err)
+			}
+			// Write msgpack record.
+			if err := policies.Put(k, newData); err != nil {
+				return err
+			}
+			// Recompute and write SHA-256 hash over the new bytes.
+			if err := policies.Put([]byte(key+policyHashSuffix), []byte(policyHashIntegrity(newData))); err != nil {
+				return err
+			}
+			// Recompute and write HMAC tag when policyKey is available.
+			if len(s.policyKey) > 0 {
+				tag := computePolicyHMAC(s.policyKey, newData)
+				if err := policies.Put([]byte(key+policyHMACSuffix), []byte(tag)); err != nil {
+					return err
+				}
+			}
+			return nil
 		})
 	})
 }

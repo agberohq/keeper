@@ -303,6 +303,27 @@ func (s *Keeper) CreateBucket(scheme, namespace string, level SecurityLevel, cre
 	return nil
 }
 
+// EnsureBucket creates a LevelPasswordOnly bucket for the scheme and namespace
+// parsed from key, if one does not already exist. It is idempotent:
+// ErrPolicyImmutable (bucket already exists) is silently ignored.
+//
+// This is the correct primitive for CLI and keepcmd operations that should work
+// across any scheme/namespace without requiring an explicit CreateBucket call.
+// It deliberately does not create LevelAdminWrapped or LevelHSM buckets —
+// those require explicit operator intent.
+func (s *Keeper) EnsureBucket(key string) error {
+	scheme, namespace, _ := parseKeyExtended(key)
+	// Nothing to do for the default namespace — it is always seeded at unlock.
+	if scheme == "" || namespace == "" || namespace == s.defaultNs {
+		return nil
+	}
+	err := s.CreateBucket(scheme, namespace, LevelPasswordOnly, "auto")
+	if err == nil || err == ErrPolicyImmutable {
+		return nil
+	}
+	return err
+}
+
 // RegisterHSMProvider attaches an HSMProvider to an existing LevelHSM or LevelRemote
 // policy in the registry. This must be called after Open and before UnlockDatabase
 // so the provider is available when the bucket is automatically unlocked.
@@ -569,6 +590,12 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 	// Upgrade any policy records that only have a SHA-256 hash to HMAC tags.
 	if err := s.upgradePolicyHMACs(); err != nil {
 		s.logger.Fields("err", err).Warn("policy HMAC upgrade failed — continuing")
+	}
+
+	// Migrate any JSON-encoded policy records to msgpack and recompute their
+	// integrity tags against the new bytes. No-op for already-migrated records.
+	if err := s.upgradePolicyEncoding(); err != nil {
+		s.logger.Fields("err", err).Warn("policy encoding upgrade failed — continuing")
 	}
 
 	// Seed all LevelPasswordOnly buckets.

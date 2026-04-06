@@ -51,7 +51,7 @@ func TestGenerateUUID_NotAllZeros(t *testing.T) {
 	}
 }
 
-// Change 9: GlobalClear
+// GlobalClear
 
 // TestGlobalClear_NilsReference verifies that GlobalClear sets the global
 // store to nil so subsequent GlobalGetKey calls return an error instead of

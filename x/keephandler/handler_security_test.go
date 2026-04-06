@@ -35,7 +35,7 @@ func newTestServerWithBucket(t *testing.T, opts ...Option) (*http.Client, string
 	return srv.Client(), srv.URL, store
 }
 
-// Change 7a: Cache-Control headers
+// Cache-Control headers
 
 // TestGet_NoCacheHeaders verifies the GET /keys/{key} response always carries
 // Cache-Control: no-store so secret values are never cached by proxies.
@@ -132,7 +132,7 @@ func TestRotateSalt_NoCacheHeaders(t *testing.T) {
 	assertNoStore(t, resp, "POST /rotate/salt")
 }
 
-// Change 7b: base64 value encoding
+// base64 value encoding
 
 // TestGet_ValueIsBase64Encoded is the primary regression test. Before the fix,
 // string(val) was returned which corrupts binary secrets that contain non-UTF-8

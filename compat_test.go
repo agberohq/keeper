@@ -201,7 +201,7 @@ func TestRotateAdminWrappedDEK_SurvivesReopen(t *testing.T) {
 	}
 }
 
-// Change 0b: Move / Copy security downgrade bypass
+// Move / Copy security downgrade bypass
 //
 // The old code short-circuited on policy lookup failure and did a raw get+set
 // with no security level comparison, bypassing ErrSecurityDowngrade.
