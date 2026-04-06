@@ -54,6 +54,7 @@ type Keeper struct {
 	defaultNs      string
 	metrics        *core.Metrics
 	schemeRegistry map[string]*BucketSecurityPolicy
+	registryMu     sync.RWMutex // protects schemeRegistry independently of s.mu
 	hooks          Hooks
 	envelope       *Envelope
 	auditStore     *auditStore
@@ -239,7 +240,10 @@ func (s *Keeper) CreateBucket(scheme, namespace string, level SecurityLevel, cre
 		// Caller must have set the HSMProvider on the policy before calling CreateBucket.
 		// We retrieve it from the registry if the caller registered it there first.
 		if policy.HSMProvider == nil {
-			if reg, ok := s.schemeRegistry[scheme+":"+namespace]; ok {
+			s.registryMu.RLock()
+			reg, ok := s.schemeRegistry[scheme+":"+namespace]
+			s.registryMu.RUnlock()
+			if ok {
 				policy.HSMProvider = reg.HSMProvider
 			}
 		}
@@ -310,7 +314,9 @@ func (s *Keeper) RegisterHSMProvider(scheme, namespace string, provider HSMProvi
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := scheme + ":" + namespace
+	s.registryMu.Lock()
 	policy, ok := s.schemeRegistry[key]
+	s.registryMu.Unlock()
 	if !ok {
 		return ErrPolicyNotFound
 	}
@@ -371,7 +377,9 @@ func (s *Keeper) AddAdminToPolicy(scheme, namespace, adminID string, adminPasswo
 	if err := s.savePolicy(policy); err != nil {
 		return err
 	}
+	s.registryMu.Lock()
 	s.schemeRegistry[fmt.Sprintf("%s:%s", scheme, namespace)] = policy
+	s.registryMu.Unlock()
 
 	// First admin: seed the Envelope so the bucket is usable immediately.
 	if len(policy.WrappedDEKs) == 1 {
@@ -410,7 +418,9 @@ func (s *Keeper) RevokeAdmin(scheme, namespace, adminID string) error {
 	if err := s.savePolicy(policy); err != nil {
 		return err
 	}
+	s.registryMu.Lock()
 	s.schemeRegistry[fmt.Sprintf("%s:%s", scheme, namespace)] = policy
+	s.registryMu.Unlock()
 	_ = s.policyChain.AppendEvent(scheme, namespace, "admin_revoked",
 		map[string]string{"admin": adminID})
 	return nil
@@ -568,7 +578,13 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 		s.auditStore.setSigningKey(nil)
 		return fmt.Errorf("failed to unlock default bucket: %w", err)
 	}
-	for _, policy := range s.schemeRegistry {
+	s.registryMu.RLock()
+	registrySnapshot := make([]*BucketSecurityPolicy, 0, len(s.schemeRegistry))
+	for _, p := range s.schemeRegistry {
+		registrySnapshot = append(registrySnapshot, p)
+	}
+	s.registryMu.RUnlock()
+	for _, policy := range registrySnapshot {
 		switch policy.Level {
 		case LevelPasswordOnly:
 			if err := s.unlockBucketPasswordOnly(policy.Scheme, policy.Namespace); err != nil {
@@ -597,7 +613,9 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 				if time.Since(last) > interval {
 					s.mu.Lock()
 					if !s.locked {
+						s.registryMu.RLock()
 						s.envelope.DropAdminWrapped(s.schemeRegistry)
+						s.registryMu.RUnlock()
 						s.audit("auto_lock_admin_wrapped", "", "", "", true, 0)
 					}
 					s.mu.Unlock()
@@ -684,11 +702,13 @@ func (s *Keeper) startDEKMigration() {
 		}
 	}
 	seedOld(s.defaultScheme, s.defaultNs)
+	s.registryMu.RLock()
 	for _, policy := range s.schemeRegistry {
 		if policy.Level == LevelPasswordOnly {
 			seedOld(policy.Scheme, policy.Namespace)
 		}
 	}
+	s.registryMu.RUnlock()
 
 	batchSize := s.config.BucketDEKMigrationBatchSize
 	if batchSize <= 0 {
@@ -778,7 +798,13 @@ func (s *Keeper) startPruneScheduler() {
 			return nil
 		}
 		s.mu.RUnlock()
-		for _, policy := range s.schemeRegistry {
+		s.registryMu.RLock()
+		policies := make([]*BucketSecurityPolicy, 0, len(s.schemeRegistry))
+		for _, p := range s.schemeRegistry {
+			policies = append(policies, p)
+		}
+		s.registryMu.RUnlock()
+		for _, policy := range policies {
 			if err := s.policyChain.PruneEvents(policy.Scheme, policy.Namespace, older, keepN); err != nil {
 				s.logger.Fields("scheme", policy.Scheme, "namespace", policy.Namespace, "err", err).Warn("audit prune failed")
 			}

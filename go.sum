@@ -16,8 +16,8 @@ github.com/olekukonko/cat v0.0.0-20250911104152-50322a0618f6 h1:zrbMGy9YXpIeTnGj
 github.com/olekukonko/cat v0.0.0-20250911104152-50322a0618f6/go.mod h1:rEKTHC9roVVicUIfZK7DYrdIoM0EOr8mK1Hj5s3JjH0=
 github.com/olekukonko/errors v1.2.0 h1:10Zcn4GeV59t/EGqJc8fUjtFT/FuUh5bTMzZ1XwmCRo=
 github.com/olekukonko/errors v1.2.0/go.mod h1:ppzxA5jBKcO1vIpCXQ9ZqgDh8iwODz6OXIGKU8r5m4Y=
-github.com/olekukonko/jack v0.0.0-20260315063850-82b24943796a h1:DqC2t+hBhPncUgU8CkYKlmA6R/5qWl4v/8WBNdLto6k=
-github.com/olekukonko/jack v0.0.0-20260315063850-82b24943796a/go.mod h1:DO5wvYWCkIkvvqssDZv8f2x6aMBAu9lIjMXBDQW8R3c=
+github.com/olekukonko/jack v0.0.0-20260405213848-6393514abff0 h1:JfZASBlR8ArP/vQgrIp7jPNZpkAjUEuqJ9hopo0zyMI=
+github.com/olekukonko/jack v0.0.0-20260405213848-6393514abff0/go.mod h1:dcRos7G6Wh85Blau7GTfreCmPwr8R2b7wZwG7I1YEHc=
 github.com/olekukonko/ll v0.1.8 h1:ysHCJRGHYKzmBSdz9w5AySztx7lG8SQY+naTGYUbsz8=
 github.com/olekukonko/ll v0.1.8/go.mod h1:RPRC6UcscfFZgjo1nulkfMH5IM0QAYim0LfnMvUuozw=
 github.com/olekukonko/prompter v0.0.0-20260405071459-26600f6d335b h1:4hc2kCGUyLGryBZ1QWPF6HaGoZZA4BGe0AccGO16Hbg=
@@ -27,6 +27,8 @@ github.com/olekukonko/zero v0.0.0-20260402164708-e3505a21b60e/go.mod h1:CBcteL2I
 github.com/pborman/getopt v0.0.0-20170112200414-7148bc3a4c30/go.mod h1:85jBQOZwpVEaDAr341tbn15RS4fCAsIst0qp7i8ex1o=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
+github.com/robfig/cron/v3 v3.0.1 h1:WdRxkvbJztn8LMz/QEvLN5sBU+xKpSqwwUO1Pjr4qDs=
+github.com/robfig/cron/v3 v3.0.1/go.mod h1:eQICP3HwyT7UooqI/z+Ov+PtYAWygg1TEWWzGIFLtro=
 github.com/stretchr/testify v1.10.0 h1:Xv5erBjTwe/5IxqUQTdXv5kgmIvbHo3QQyRwhJsOfJA=
 github.com/stretchr/testify v1.10.0/go.mod h1:r2ic/lqez/lEtzL7wO/rwa5dbSLXVDPFyf8C91i36aY=
 github.com/vmihailenco/msgpack/v5 v5.4.1 h1:cQriyiUvjTwOHg8QZaPihLWeRAAVoCpE00IUPn0Bjt8=

@@ -391,7 +391,10 @@ func (s *Keeper) resumeRotation(masterKey []byte) error {
 // master-key re-encryption. Unregistered keys default to false.
 func (s *Keeper) isHSMOrRemotePolicy(scheme, namespace string) bool {
 	key := scheme + ":" + namespace
-	if p, ok := s.schemeRegistry[key]; ok {
+	s.registryMu.RLock()
+	p, ok := s.schemeRegistry[key]
+	s.registryMu.RUnlock()
+	if ok {
 		return p.Level == LevelHSM || p.Level == LevelRemote
 	}
 	return false
@@ -902,7 +905,9 @@ func (s *Keeper) loadPolicies() error {
 			if err := json.Unmarshal(v, &policy); err != nil {
 				return err
 			}
+			s.registryMu.Lock()
 			s.schemeRegistry[key] = &policy
+			s.registryMu.Unlock()
 			return nil
 		})
 	})
@@ -912,7 +917,10 @@ func (s *Keeper) loadPolicies() error {
 // the store is unlocked. Falls back to SHA-256 when no HMAC tag exists yet.
 func (s *Keeper) loadPolicy(scheme, namespace string) (*BucketSecurityPolicy, error) {
 	key := fmt.Sprintf("%s:%s", scheme, namespace)
-	if p, ok := s.schemeRegistry[key]; ok {
+	s.registryMu.RLock()
+	p, ok := s.schemeRegistry[key]
+	s.registryMu.RUnlock()
+	if ok {
 		return p, nil
 	}
 	var policy BucketSecurityPolicy
@@ -953,7 +961,9 @@ func (s *Keeper) loadPolicy(scheme, namespace string) (*BucketSecurityPolicy, er
 	if err != nil {
 		return nil, err
 	}
+	s.registryMu.Lock()
 	s.schemeRegistry[key] = &policy
+	s.registryMu.Unlock()
 	return &policy, nil
 }
 
@@ -1166,7 +1176,7 @@ func (s *Keeper) decryptMetaWithKey(data, metaKey []byte) (*EncryptedMetadata, e
 	return &meta, nil
 }
 
-// ── Per-bucket DEK derivation migration ──────────────────────────────────────
+// Per-bucket DEK derivation migration
 
 // runMigrationBatch re-encrypts up to batchSize records across all
 // LevelPasswordOnly buckets using the new per-bucket derived DEK.
@@ -1185,8 +1195,8 @@ func (s *Keeper) runMigrationBatch(batchSize int) (complete bool, err error) {
 	type bucketRef = migrationBucket
 	var buckets []bucketRef
 	func() {
-		s.mu.RLock()
-		defer s.mu.RUnlock()
+		s.registryMu.RLock()
+		defer s.registryMu.RUnlock()
 		buckets = append(buckets, bucketRef{s.defaultScheme, s.defaultNs})
 		for _, policy := range s.schemeRegistry {
 			if policy.Level == LevelPasswordOnly {

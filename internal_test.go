@@ -286,7 +286,7 @@ func TestIncrementAccessCount(t *testing.T) {
 	}
 }
 
-// ── Change 3: Per-bucket DEK derivation ──────────────────────────────────────
+// Change 3: Per-bucket DEK derivation
 
 func TestDeriveBucketDEK_Deterministic(t *testing.T) {
 	master := make([]byte, 32)
