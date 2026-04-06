@@ -56,25 +56,73 @@ func (c *Commands) open() (*keeper.Keeper, func(), error) {
 	return store, func() { store.Close() }, nil
 }
 
-// List prints all secret keys in the configured bucket.
-func (c *Commands) List() error {
+// List prints secret keys.
+//
+//	List()          — all keys across every scheme and namespace
+//	List(scheme)    — all keys in every namespace of that scheme
+//	List(scheme,ns) — all keys in the specific bucket
+func (c *Commands) List(filter ...string) error {
 	store, cleanup, err := c.open()
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 
-	keys, err := store.List()
-	if err != nil {
-		return fmt.Errorf("list: %w", err)
+	var rows [][]string
+
+	switch len(filter) {
+	case 0:
+		// All schemes → all namespaces → all keys.
+		schemes, err := store.ListSchemes()
+		if err != nil {
+			return fmt.Errorf("list schemes: %w", err)
+		}
+		for _, scheme := range schemes {
+			namespaces, err := store.ListNamespacesInSchemeFull(scheme)
+			if err != nil {
+				return fmt.Errorf("list namespaces in %s: %w", scheme, err)
+			}
+			for _, ns := range namespaces {
+				keys, err := store.ListNamespacedFull(scheme, ns)
+				if err != nil {
+					return fmt.Errorf("list %s/%s: %w", scheme, ns, err)
+				}
+				for _, k := range keys {
+					rows = append(rows, []string{scheme + "/" + ns + "/" + k})
+				}
+			}
+		}
+	case 1:
+		// One scheme → all its namespaces → all keys.
+		scheme := filter[0]
+		namespaces, err := store.ListNamespacesInSchemeFull(scheme)
+		if err != nil {
+			return fmt.Errorf("list namespaces in %s: %w", scheme, err)
+		}
+		for _, ns := range namespaces {
+			keys, err := store.ListNamespacedFull(scheme, ns)
+			if err != nil {
+				return fmt.Errorf("list %s/%s: %w", scheme, ns, err)
+			}
+			for _, k := range keys {
+				rows = append(rows, []string{ns + "/" + k})
+			}
+		}
+	default:
+		// Explicit scheme + namespace.
+		scheme, ns := filter[0], filter[1]
+		keys, err := store.ListNamespacedFull(scheme, ns)
+		if err != nil {
+			return fmt.Errorf("list %s/%s: %w", scheme, ns, err)
+		}
+		for _, k := range keys {
+			rows = append(rows, []string{k})
+		}
 	}
-	if len(keys) == 0 {
+
+	if len(rows) == 0 {
 		c.Out.Info("store is empty")
 		return nil
-	}
-	rows := make([][]string, len(keys))
-	for i, k := range keys {
-		rows[i] = []string{k}
 	}
 	c.Out.Table([]string{"Key"}, rows)
 	return nil

@@ -40,6 +40,9 @@ func NewAES256GCMCipher(key []byte) (*AES256GCMCipher, error) {
 	return &AES256GCMCipher{aead: aead}, nil
 }
 
+// KeySize implements Cipher. AES-256-GCM requires a 32-byte (256-bit) key.
+func (c *AES256GCMCipher) KeySize() int { return 32 }
+
 // Encrypt implements Cipher. A random 12-byte nonce is prepended to the
 // ciphertext. The nonce is generated using crypto/rand.
 func (c *AES256GCMCipher) Encrypt(plaintext []byte) ([]byte, error) {

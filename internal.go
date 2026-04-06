@@ -43,48 +43,175 @@ func unmarshalEncryptedMetadata(data []byte, m *EncryptedMetadata) error {
 	return msgpack.Unmarshal(data, m)
 }
 
-// marshalPolicy encodes a BucketSecurityPolicy using msgpack.
-func marshalPolicy(p *BucketSecurityPolicy) ([]byte, error) {
-	return msgpack.Marshal(p)
+// marshalPolicy encodes a BucketSecurityPolicy using msgpack and encrypts it
+// with policyEncKey when the store is unlocked. When policyEncKey is nil
+// (store locked or key not yet derived), returns plain msgpack — this path
+// is only hit during CreateBucket before the first unlock, which is a setup
+// operation that runs before any encryption keys exist.
+func (s *Keeper) marshalPolicy(p *BucketSecurityPolicy) ([]byte, error) {
+	plain, err := msgpack.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	if len(s.policyEncKey) == 0 {
+		return plain, nil
+	}
+	return s.encryptMetadata(plain, s.policyEncKey)
 }
+
+// errPolicyEncrypted is returned by unmarshalPolicy when the blob is ciphertext
+// but policyEncKey is not yet available (store locked / pre-unlock load).
+// loadPolicies treats this as a skip signal, not a hard failure.
+var errPolicyEncrypted = stdErrors.New("policy is encrypted — key not available")
 
 // unmarshalPolicy decodes a BucketSecurityPolicy.
-// New records are msgpack; legacy records written before this change are JSON.
-// Detection: JSON objects always start with '{' (0x7b); msgpack fixmap/map
-// headers are in the range 0x80–0x8f, 0xde, or 0xdf — never 0x7b.
-func unmarshalPolicy(data []byte, p *BucketSecurityPolicy) error {
-	if len(data) > 0 && data[0] == '{' {
-		return json.Unmarshal(data, p)
+// When policyEncKey is set, decryption is attempted first. When it is not set
+// and the blob looks like ciphertext (not JSON and not a msgpack map header),
+// errPolicyEncrypted is returned so the caller can skip the entry gracefully.
+func (s *Keeper) unmarshalPolicy(data []byte, p *BucketSecurityPolicy) error {
+	if len(data) == 0 {
+		return fmt.Errorf("unmarshalPolicy: empty data")
 	}
-	return msgpack.Unmarshal(data, p)
+	payload := data
+	// isCiphertext reports whether the first byte looks like a random nonce prefix
+	// rather than a structured plaintext encoding.
+	isCiphertext := func(b byte) bool {
+		isJSON := b == '{'
+		isMsgpackMap := b >= 0x80 && b <= 0x8f || b == 0xde || b == 0xdf
+		return !isJSON && !isMsgpackMap
+	}
+
+	if len(s.policyEncKey) > 0 {
+		// Key available: try decryption.
+		if dec, err := s.decryptMetadata(data, s.policyEncKey); err == nil {
+			payload = dec
+		} else if isCiphertext(data[0]) {
+			// Decryption failed and the blob looks like ciphertext. This should
+			// not happen with a correct key, but guard against it to prevent
+			// msgpack from receiving raw ciphertext and emitting a confusing error.
+			return fmt.Errorf("policy decryption failed (key mismatch or corrupt blob): %w", err)
+		}
+		// If decryption failed but the blob looks like plaintext (JSON/msgpack),
+		// fall through — the record was written before encryption was enabled.
+	} else {
+		// No key yet. Plaintext records start with '{' (JSON) or a msgpack map header.
+		// Anything else is ciphertext — skip it; UnlockDatabase will reload with the key.
+		if isCiphertext(data[0]) {
+			return errPolicyEncrypted
+		}
+	}
+	if len(payload) > 0 && payload[0] == '{' {
+		return json.Unmarshal(payload, p)
+	}
+	return msgpack.Unmarshal(payload, p)
 }
 
-// marshalWAL encodes a RotationWAL using msgpack.
-func marshalWAL(w *RotationWAL) ([]byte, error) {
-	return msgpack.Marshal(w)
+// marshalWAL encodes a RotationWAL using msgpack and encrypts it.
+func (s *Keeper) marshalWAL(w *RotationWAL) ([]byte, error) {
+	plain, err := msgpack.Marshal(w)
+	if err != nil {
+		return nil, err
+	}
+	if len(s.policyEncKey) == 0 {
+		return plain, nil
+	}
+	return s.encryptMetadata(plain, s.policyEncKey)
 }
 
-// unmarshalWAL decodes a RotationWAL.
-// Applies the same JSON-fallback detection as unmarshalPolicy.
-func unmarshalWAL(data []byte, w *RotationWAL) error {
-	if len(data) > 0 && data[0] == '{' {
-		return json.Unmarshal(data, w)
+// unmarshalWAL decodes a RotationWAL, decrypting if policyEncKey is set.
+func (s *Keeper) unmarshalWAL(data []byte, w *RotationWAL) error {
+	payload := data
+	if len(s.policyEncKey) > 0 {
+		if dec, err := s.decryptMetadata(data, s.policyEncKey); err == nil {
+			payload = dec
+		}
 	}
-	return msgpack.Unmarshal(data, w)
+	if len(payload) > 0 && payload[0] == '{' {
+		return json.Unmarshal(payload, w)
+	}
+	return msgpack.Unmarshal(payload, w)
 }
 
 // marshalSaltStore encodes a SaltStore using msgpack.
-func marshalSaltStore(s *SaltStore) ([]byte, error) {
-	return msgpack.Marshal(s)
+// The KDF salt is intentionally stored unencrypted: it must be readable before
+// UnlockDatabase (to derive the master key), so encrypting it with policyEncKey
+// — which is only available after unlock — would create a circular dependency.
+// A KDF salt is not a secret; its purpose is uniqueness, not confidentiality.
+func (s *Keeper) marshalSaltStore(st *SaltStore) ([]byte, error) {
+	return msgpack.Marshal(st)
 }
 
-// unmarshalSaltStore decodes a SaltStore.
-// Applies the same JSON-fallback detection as unmarshalPolicy.
-func unmarshalSaltStore(data []byte, s *SaltStore) error {
+// unmarshalSaltStore decodes a SaltStore from msgpack or legacy JSON.
+func (s *Keeper) unmarshalSaltStore(data []byte, st *SaltStore) error {
 	if len(data) > 0 && data[0] == '{' {
-		return json.Unmarshal(data, s)
+		return json.Unmarshal(data, st)
 	}
-	return msgpack.Unmarshal(data, s)
+	return msgpack.Unmarshal(data, st)
+}
+
+// Metadata encryption key derivation
+
+// deriveMetadataKeys derives policyEncKey and auditEncKey from masterKey using
+// HKDF-SHA256. Key length is determined from the configured cipher's KeySize()
+// method, defaulting to masterKeyLen (32) when NewCipher is nil.
+func deriveMetadataKeys(masterKey []byte, cfg Config) (policyEncKey, auditEncKey []byte, err error) {
+	keyLen := masterKeyLen
+	if cfg.NewCipher != nil {
+		if probe, perr := cfg.NewCipher(make([]byte, masterKeyLen)); perr == nil {
+			keyLen = probe.KeySize()
+		}
+	}
+	expand := func(info string) ([]byte, error) {
+		r := hkdf.New(sha256.New, masterKey, nil, []byte(info))
+		k := make([]byte, keyLen)
+		if _, err := io.ReadFull(r, k); err != nil {
+			return nil, fmt.Errorf("%s: HKDF expansion failed: %w", info, err)
+		}
+		return k, nil
+	}
+	policyEncKey, err = expand(hkdfInfoPolicyEnc)
+	if err != nil {
+		return nil, nil, err
+	}
+	auditEncKey, err = expand(hkdfInfoAuditEnc)
+	if err != nil {
+		zero.Bytes(policyEncKey)
+		return nil, nil, err
+	}
+	return policyEncKey, auditEncKey, nil
+}
+
+// Policy bucket key helpers
+
+// policyBaseKey returns the opaque on-disk key for a scheme:namespace pair.
+// SHA-256("scheme:namespace")[:16] encoded as 32 hex chars = 128-bit key space.
+func policyBaseKey(scheme, namespace string) string {
+	h := sha256.Sum256([]byte(scheme + ":" + namespace))
+	return hex.EncodeToString(h[:16])
+}
+
+func policyHashKey(base string) string { return base + policyHashSuffix }
+func policyHMACKey(base string) string { return base + policyHMACSuffix }
+
+// Generic metadata encrypt / decrypt
+
+// encryptMetadata encrypts plaintext using the keeper's configured cipher.
+// Wire format: nonce(cipher.NonceSize()) || AEAD-ciphertext.
+func (s *Keeper) encryptMetadata(plaintext, key []byte) ([]byte, error) {
+	c, err := s.config.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("encryptMetadata: cipher init: %w", err)
+	}
+	return c.Encrypt(plaintext)
+}
+
+// decryptMetadata decrypts a blob produced by encryptMetadata.
+func (s *Keeper) decryptMetadata(blob, key []byte) ([]byte, error) {
+	c, err := s.config.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("decryptMetadata: cipher init: %w", err)
+	}
+	return c.Decrypt(blob)
 }
 
 func (s *Keeper) initBuckets() error {
@@ -624,7 +751,7 @@ func (s *Keeper) reencryptRecord(scheme, namespace, key string, effectiveNew, ef
 }
 
 func (s *Keeper) writeRotationWAL(wal *RotationWAL) error {
-	data, err := marshalWAL(wal)
+	data, err := s.marshalWAL(wal)
 	if err != nil {
 		return err
 	}
@@ -648,7 +775,7 @@ func (s *Keeper) readRotationWAL() (*RotationWAL, error) {
 		if data == nil {
 			return stdErrors.New("rotation WAL not found")
 		}
-		return unmarshalWAL(data, &wal)
+		return s.unmarshalWAL(data, &wal)
 	})
 	return &wal, err
 }
@@ -801,14 +928,14 @@ func (s *Keeper) loadSaltStore() (*SaltStore, error) {
 		return store, nil
 	}
 	var store SaltStore
-	if err := unmarshalSaltStore(raw, &store); err != nil {
+	if err := s.unmarshalSaltStore(raw, &store); err != nil {
 		return nil, fmt.Errorf("failed to decode salt store: %w", err)
 	}
 	return &store, nil
 }
 
 func (s *Keeper) saveSaltStore(store *SaltStore) error {
-	data, err := marshalSaltStore(store)
+	data, err := s.marshalSaltStore(store)
 	if err != nil {
 		return err
 	}
@@ -912,26 +1039,28 @@ func policyHashIntegrity(data []byte) string {
 // savePolicy persists a policy with both a SHA-256 hash and, when the store
 // is unlocked (policyKey set), an authenticated HMAC tag. All three entries
 // are written in one atomic bbolt.Update — no partial state is possible.
+// The on-disk key is policyBaseKey(scheme, namespace) — an opaque 32-hex-char
+// hash that hides the bucket structure from offline readers.
 func (s *Keeper) savePolicy(policy *BucketSecurityPolicy) error {
 	return s.db.Update(func(tx pkgstore.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(policyBucket))
 		if err != nil {
 			return err
 		}
-		key := fmt.Sprintf("%s:%s", policy.Scheme, policy.Namespace)
-		data, err := marshalPolicy(policy)
+		base := policyBaseKey(policy.Scheme, policy.Namespace)
+		data, err := s.marshalPolicy(policy)
 		if err != nil {
 			return err
 		}
-		if err := bucket.Put([]byte(key), data); err != nil {
+		if err := bucket.Put([]byte(base), data); err != nil {
 			return err
 		}
-		if err := bucket.Put([]byte(key+policyHashSuffix), []byte(policyHashIntegrity(data))); err != nil {
+		if err := bucket.Put([]byte(policyHashKey(base)), []byte(policyHashIntegrity(data))); err != nil {
 			return err
 		}
 		if len(s.policyKey) > 0 {
 			tag := computePolicyHMAC(s.policyKey, data)
-			if err := bucket.Put([]byte(key+policyHMACSuffix), []byte(tag)); err != nil {
+			if err := bucket.Put([]byte(policyHMACKey(base)), []byte(tag)); err != nil {
 				return err
 			}
 		}
@@ -940,7 +1069,10 @@ func (s *Keeper) savePolicy(policy *BucketSecurityPolicy) error {
 }
 
 // loadPolicies populates schemeRegistry at startup before unlock.
-// Only the SHA-256 hash is verified at this stage.
+// Iterates all keys in the policy bucket, skips hash/HMAC suffix keys,
+// decrypts and decodes each policy value.
+// When called before UnlockDatabase (policyEncKey nil), encrypted entries are
+// silently skipped — UnlockDatabase re-calls loadPolicies once the key is set.
 func (s *Keeper) loadPolicies() error {
 	return s.db.View(func(tx pkgstore.Tx) error {
 		policies := tx.Bucket([]byte(policyBucket))
@@ -953,11 +1085,17 @@ func (s *Keeper) loadPolicies() error {
 				return nil
 			}
 			var policy BucketSecurityPolicy
-			if err := unmarshalPolicy(v, &policy); err != nil {
+			if err := s.unmarshalPolicy(v, &policy); err != nil {
+				if stdErrors.Is(err, errPolicyEncrypted) {
+					// Key not available yet — skip; UnlockDatabase will reload.
+					return nil
+				}
 				return err
 			}
+			// Registry key is always "scheme:namespace" in memory.
+			registryKey := fmt.Sprintf("%s:%s", policy.Scheme, policy.Namespace)
 			s.registryMu.Lock()
-			s.schemeRegistry[key] = &policy
+			s.schemeRegistry[registryKey] = &policy
 			s.registryMu.Unlock()
 			return nil
 		})
@@ -967,63 +1105,60 @@ func (s *Keeper) loadPolicies() error {
 // loadPolicy returns the policy for scheme/namespace, verifying the HMAC when
 // the store is unlocked. Falls back to SHA-256 when no HMAC tag exists yet.
 func (s *Keeper) loadPolicy(scheme, namespace string) (*BucketSecurityPolicy, error) {
-	key := fmt.Sprintf("%s:%s", scheme, namespace)
+	registryKey := fmt.Sprintf("%s:%s", scheme, namespace)
 	s.registryMu.RLock()
-	p, ok := s.schemeRegistry[key]
+	p, ok := s.schemeRegistry[registryKey]
 	s.registryMu.RUnlock()
 	if ok {
 		return p, nil
 	}
+	base := policyBaseKey(scheme, namespace)
 	var policy BucketSecurityPolicy
 	err := s.db.View(func(tx pkgstore.Tx) error {
 		policies := tx.Bucket([]byte(policyBucket))
 		if policies == nil {
 			return ErrPolicyNotFound
 		}
-		data := policies.Get([]byte(key))
+		data := policies.Get([]byte(base))
 		if data == nil {
 			return ErrPolicyNotFound
 		}
 
 		if len(s.policyKey) > 0 {
-			if tag := policies.Get([]byte(key + policyHMACSuffix)); tag != nil {
+			if tag := policies.Get([]byte(policyHMACKey(base))); tag != nil {
 				expected := computePolicyHMAC(s.policyKey, data)
 				if !hmac.Equal([]byte(expected), tag) {
-					return fmt.Errorf("%w: HMAC mismatch for policy %s", ErrPolicySignature, key)
+					return fmt.Errorf("%w: HMAC mismatch for policy %s:%s", ErrPolicySignature, scheme, namespace)
 				}
 			} else {
-				// No HMAC yet — fall back to SHA-256.
-				if storedHash := policies.Get([]byte(key + policyHashSuffix)); storedHash != nil {
+				if storedHash := policies.Get([]byte(policyHashKey(base))); storedHash != nil {
 					if policyHashIntegrity(data) != string(storedHash) {
-						return fmt.Errorf("policy integrity check failed for %s", key)
+						return fmt.Errorf("policy integrity check failed for %s:%s", scheme, namespace)
 					}
 				}
 			}
 		} else {
-			if storedHash := policies.Get([]byte(key + policyHashSuffix)); storedHash != nil {
+			if storedHash := policies.Get([]byte(policyHashKey(base))); storedHash != nil {
 				if policyHashIntegrity(data) != string(storedHash) {
-					return fmt.Errorf("policy integrity check failed for %s", key)
+					return fmt.Errorf("policy integrity check failed for %s:%s", scheme, namespace)
 				}
 			}
 		}
 
-		return unmarshalPolicy(data, &policy)
+		return s.unmarshalPolicy(data, &policy)
 	})
 	if err != nil {
 		return nil, err
 	}
 	s.registryMu.Lock()
-	s.schemeRegistry[key] = &policy
+	s.schemeRegistry[registryKey] = &policy
 	s.registryMu.Unlock()
 	return &policy, nil
 }
 
-// upgradePolicyHMACs writes HMAC tags for any policy that has only a SHA-256
-// hash. Called from UnlockDatabase and Rotate after the policyKey is set.
-// Each policy's HMAC is written in the same transaction as its existing data,
-// so no partial state is possible within a single policy upgrade.
-// If the process crashes mid-upgrade, the next UnlockDatabase will re-run this
-// function and complete the remaining policies.
+// upgradePolicyHMACs writes HMAC tags for any policy that only has a SHA-256
+// hash. Called from UnlockDatabase and Rotate after policyKey is set.
+// Uses hashed keys — compatible with the new savePolicy layout.
 func (s *Keeper) upgradePolicyHMACs() error {
 	if len(s.policyKey) == 0 {
 		return nil
@@ -1038,62 +1173,12 @@ func (s *Keeper) upgradePolicyHMACs() error {
 			if isPolicyHashKey(key) {
 				return nil
 			}
-			if policies.Get([]byte(key+policyHMACSuffix)) != nil {
+			hmacKey := key + policyHMACSuffix
+			if policies.Get([]byte(hmacKey)) != nil {
 				return nil // already has HMAC tag
 			}
 			tag := computePolicyHMAC(s.policyKey, v)
-			return policies.Put([]byte(key+policyHMACSuffix), []byte(tag))
-		})
-	})
-}
-
-// upgradePolicyEncoding re-encodes any JSON-encoded policy records to msgpack
-// and recomputes their SHA-256 hash and HMAC tags against the new bytes.
-// Called from UnlockDatabase after upgradePolicyHMACs. Crash-safe: if the
-// process dies mid-upgrade, any remaining JSON-encoded records are detected and
-// migrated on the next UnlockDatabase call. Already-migrated records (first
-// byte != '{') are skipped in O(1).
-func (s *Keeper) upgradePolicyEncoding() error {
-	return s.db.Update(func(tx pkgstore.Tx) error {
-		policies := tx.Bucket([]byte(policyBucket))
-		if policies == nil {
-			return nil
-		}
-		return policies.ForEach(func(k, v []byte) error {
-			key := string(k)
-			if isPolicyHashKey(key) {
-				return nil
-			}
-			// Already msgpack — nothing to do.
-			if len(v) == 0 || v[0] != '{' {
-				return nil
-			}
-			// Decode the JSON record.
-			var policy BucketSecurityPolicy
-			if err := json.Unmarshal(v, &policy); err != nil {
-				return fmt.Errorf("upgradePolicyEncoding: decode %s: %w", key, err)
-			}
-			// Re-encode as msgpack.
-			newData, err := marshalPolicy(&policy)
-			if err != nil {
-				return fmt.Errorf("upgradePolicyEncoding: encode %s: %w", key, err)
-			}
-			// Write msgpack record.
-			if err := policies.Put(k, newData); err != nil {
-				return err
-			}
-			// Recompute and write SHA-256 hash over the new bytes.
-			if err := policies.Put([]byte(key+policyHashSuffix), []byte(policyHashIntegrity(newData))); err != nil {
-				return err
-			}
-			// Recompute and write HMAC tag when policyKey is available.
-			if len(s.policyKey) > 0 {
-				tag := computePolicyHMAC(s.policyKey, newData)
-				if err := policies.Put([]byte(key+policyHMACSuffix), []byte(tag)); err != nil {
-					return err
-				}
-			}
-			return nil
+			return policies.Put([]byte(hmacKey), []byte(tag))
 		})
 	})
 }

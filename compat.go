@@ -254,7 +254,9 @@ func (s *Keeper) RotateAdminWrappedDEK(scheme, namespace, adminID string, adminP
 	if err := s.savePolicy(policy); err != nil {
 		return fmt.Errorf("failed to save updated policy: %w", err)
 	}
+	s.registryMu.Lock()
 	s.schemeRegistry[fmt.Sprintf("%s:%s", scheme, namespace)] = policy
+	s.registryMu.Unlock()
 	_ = s.policyChain.AppendEvent(scheme, namespace, "dek_rekeyed",
 		map[string]string{"admin": adminID})
 	s.logger.Fields("scheme", scheme, "namespace", namespace, "admin", adminID).Info("DEK re-keyed successfully")

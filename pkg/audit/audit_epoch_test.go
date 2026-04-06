@@ -50,7 +50,7 @@ func appendEvent(t *testing.T, s *Store, scheme, namespace, id string) {
 		PrevChecksum: prev,
 	}
 	e.Checksum = e.ComputeChecksum(prev)
-	if err := s.Append(scheme, namespace, e); err != nil {
+	if err := s.Append(scheme, namespace, e, nil); err != nil {
 		t.Fatalf("Append %s: %v", id, err)
 	}
 }
@@ -100,7 +100,7 @@ func appendCheckpoint(t *testing.T, s *Store, scheme, namespace string, oldKey, 
 		PrevChecksum: prev,
 	}
 	e.Checksum = e.ComputeChecksum(prev)
-	if err := s.Append(scheme, namespace, e); err != nil {
+	if err := s.Append(scheme, namespace, e, nil); err != nil {
 		t.Fatalf("appendCheckpoint: %v", err)
 	}
 }
@@ -186,7 +186,7 @@ func TestVerifyIntegrity_CheckpointWithoutWrappedKey(t *testing.T) {
 		PrevChecksum: prev,
 	}
 	ckpt.Checksum = ckpt.ComputeChecksum(prev)
-	live.Append("sc", "ns", ckpt) //nolint:errcheck
+	live.Append("sc", "ns", ckpt, nil) //nolint:errcheck
 
 	verifier := New(db, oldKey)
 	if err := verifier.VerifyIntegrity("sc", "ns"); err != nil {

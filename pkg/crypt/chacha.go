@@ -61,6 +61,9 @@ func newFromKey(key []byte) (*XChacha20Cipher, error) {
 	return &XChacha20Cipher{aead: aead}, nil
 }
 
+// KeySize implements Cipher. XChaCha20-Poly1305 requires a 32-byte key.
+func (c *XChacha20Cipher) KeySize() int { return chacha20poly1305.KeySize }
+
 // Encrypt implements Cipher. A random nonce is prepended to the ciphertext.
 func (c *XChacha20Cipher) Encrypt(plaintext []byte) ([]byte, error) {
 	if c == nil || c.aead == nil {

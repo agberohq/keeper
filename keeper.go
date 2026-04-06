@@ -60,6 +60,8 @@ type Keeper struct {
 	auditStore     *auditStore
 	policyChain    *Chain
 	policyKey      []byte // HMAC key for policy authentication; nil when locked
+	policyEncKey   []byte // encryption key for policy/WAL/SaltStore; nil when locked
+	auditEncKey    []byte // encryption key for audit Scheme/Namespace/Details; nil when locked
 
 	// Jack-managed background components; nil when running without Jack.
 	autoLocker      *jack.Looper
@@ -592,6 +594,30 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 	}
 	s.policyKey = policyKey
 
+	// Derive metadata encryption keys (policy/WAL/SaltStore and audit fields).
+	masterBytes3, err := master.Bytes()
+	if err != nil {
+		s.locked = true
+		s.master = nil
+		s.auditStore.setSigningKey(nil)
+		zero.Bytes(s.policyKey)
+		s.policyKey = nil
+		return fmt.Errorf("failed to read master key for metadata key derivation: %w", err)
+	}
+	policyEncKey, auditEncKey, err := deriveMetadataKeys(masterBytes3, s.config)
+	zero.Bytes(masterBytes3)
+	if err != nil {
+		s.locked = true
+		s.master = nil
+		s.auditStore.setSigningKey(nil)
+		zero.Bytes(s.policyKey)
+		s.policyKey = nil
+		return fmt.Errorf("failed to derive metadata encryption keys: %w", err)
+	}
+	s.policyEncKey = policyEncKey
+	s.auditEncKey = auditEncKey
+	s.auditStore.setEncKey(auditEncKey)
+
 	// If a rotation was interrupted by a crash, complete it now.
 	// The master key has been verified, so we know it is the new key.
 	if s.hasIncompleteRotation() {
@@ -600,8 +626,13 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 			s.locked = true
 			s.master = nil
 			s.auditStore.setSigningKey(nil)
+			s.auditStore.setEncKey(nil)
 			zero.Bytes(s.policyKey)
 			s.policyKey = nil
+			zero.Bytes(s.policyEncKey)
+			s.policyEncKey = nil
+			zero.Bytes(s.auditEncKey)
+			s.auditEncKey = nil
 			return fmt.Errorf("failed to read master key for rotation resume: %w", rerr)
 		}
 		if rerr := s.resumeRotation(masterBytesForResume); rerr != nil {
@@ -609,8 +640,13 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 			s.locked = true
 			s.master = nil
 			s.auditStore.setSigningKey(nil)
+			s.auditStore.setEncKey(nil)
 			zero.Bytes(s.policyKey)
 			s.policyKey = nil
+			zero.Bytes(s.policyEncKey)
+			s.policyEncKey = nil
+			zero.Bytes(s.auditEncKey)
+			s.auditEncKey = nil
 			return fmt.Errorf("failed to resume interrupted rotation: %w", rerr)
 		}
 		zero.Bytes(masterBytesForResume)
@@ -622,17 +658,18 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 		s.logger.Fields("err", err).Warn("policy HMAC upgrade failed — continuing")
 	}
 
-	// Migrate any JSON-encoded policy records to msgpack and recompute their
-	// integrity tags against the new bytes. No-op for already-migrated records.
-	if err := s.upgradePolicyEncoding(); err != nil {
-		s.logger.Fields("err", err).Warn("policy encoding upgrade failed — continuing")
-	}
-
 	// Seed all LevelPasswordOnly buckets.
 	if err := s.unlockBucketPasswordOnly(s.defaultScheme, s.defaultNs); err != nil {
 		s.locked = true
 		s.master = nil
 		s.auditStore.setSigningKey(nil)
+		s.auditStore.setEncKey(nil)
+		zero.Bytes(s.policyKey)
+		s.policyKey = nil
+		zero.Bytes(s.policyEncKey)
+		s.policyEncKey = nil
+		zero.Bytes(s.auditEncKey)
+		s.auditEncKey = nil
 		return fmt.Errorf("failed to unlock default bucket: %w", err)
 	}
 	s.registryMu.RLock()
@@ -960,8 +997,13 @@ func (s *Keeper) Lock() error {
 	}
 	s.envelope.DropAll()
 	s.auditStore.setSigningKey(nil)
+	s.auditStore.setEncKey(nil)
 	zero.Bytes(s.policyKey)
 	s.policyKey = nil
+	zero.Bytes(s.policyEncKey)
+	s.policyEncKey = nil
+	zero.Bytes(s.auditEncKey)
+	s.auditEncKey = nil
 	if s.master != nil {
 		s.master.Destroy()
 		s.master = nil
@@ -1795,6 +1837,27 @@ func (s *Keeper) SetHooks(hooks Hooks) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.hooks = hooks
+}
+
+// ExportAuditKey derives and returns a fresh copy of the audit encryption key.
+// The caller must zero the returned slice when done.
+// Returns an error when the store is locked.
+func (s *Keeper) ExportAuditKey() ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.locked {
+		return nil, ErrStoreLocked
+	}
+	masterBytes, err := s.master.Bytes()
+	if err != nil {
+		return nil, fmt.Errorf("ExportAuditKey: %w", err)
+	}
+	defer zero.Bytes(masterBytes)
+	_, auditEncKey, err := deriveMetadataKeys(masterBytes, s.config)
+	if err != nil {
+		return nil, fmt.Errorf("ExportAuditKey: %w", err)
+	}
+	return auditEncKey, nil
 }
 
 // SetDefaultScheme sets the default scheme used when none is specified.

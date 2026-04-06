@@ -112,8 +112,17 @@ func (s *replSession) dispatch(line string) (exit bool, err error) {
 		fmt.Print("\033[H\033[2J")
 
 	case "list", "ls":
-		warnExtraArgs(cmd, args)
-		err = s.cmds.List()
+		// list                    — all keys across all schemes/namespaces
+		// list <scheme>           — all keys in every namespace of that scheme
+		// list <scheme> <ns>      — all keys in a specific bucket
+		switch len(args) {
+		case 0:
+			err = s.cmds.List()
+		case 1:
+			err = s.cmds.List(args[0])
+		default:
+			err = s.cmds.List(args[0], args[1])
+		}
 
 	case "get", "cat":
 		if len(args) == 0 {
@@ -227,7 +236,7 @@ func warnExtraArgs(cmd string, args []string) {
 func (s *replSession) printHelp() {
 	fmt.Print(`
 Commands:
-  ls  | list             List all keys
+  ls  | list [s] [ns]   List all keys (optional: filter by scheme / namespace)
   cat | get  <key>       Read a secret value
   put | set  <key>       Store a secret (value prompted hidden — not in scrollback)
   rm  | delete <key>     Remove a key (asks for confirmation)

@@ -54,33 +54,17 @@ func chain(t *testing.T, s *Store, scheme, namespace string, n int) {
 			PrevChecksum: prev,
 		}
 		e.Checksum = e.ComputeChecksum(prev)
-		if err := s.Append(scheme, namespace, e); err != nil {
+		if err := s.Append(scheme, namespace, e, nil); err != nil {
 			t.Fatalf("Append failed: %v", err)
 		}
 		prev = e.Checksum
 	}
 }
 
-func injectCorruptEvent(t *testing.T, s *Store, scheme, namespace string, corruptFunc func(*Event)) {
-	t.Helper()
-	// Load existing events
-	events, err := s.LoadChain(scheme, namespace)
-	if err != nil {
-		t.Fatalf("LoadChain: %v", err)
-	}
-	if len(events) == 0 {
-		t.Fatal("no events to corrupt")
-	}
-	// Corrupt the event in memory
-	corruptFunc(events[0])
-	// Re-append will create a NEW event with new Seq, but we can test verification on the corrupted copy directly
-	// For true storage tampering tests, see package-level tests or add test hooks
-}
-
 func TestAppendAndLoad(t *testing.T) {
 	s := newStore(t)
 	chain(t, s, "sc", "ns", 1)
-	events, err := s.LoadChain("sc", "ns")
+	events, err := s.LoadChain("sc", "ns", nil)
 	if err != nil {
 		t.Fatalf("LoadChain: %v", err)
 	}
@@ -95,7 +79,7 @@ func TestAppendAndLoad(t *testing.T) {
 func TestSeqMonotonic(t *testing.T) {
 	s := newStore(t)
 	chain(t, s, "sc", "ns", 5)
-	events, _ := s.LoadChain("sc", "ns")
+	events, _ := s.LoadChain("sc", "ns", nil)
 	for i := 1; i < len(events); i++ {
 		if events[i].Seq <= events[i-1].Seq {
 			t.Errorf("non-monotonic Seq at %d: %d <= %d", i, events[i].Seq, events[i-1].Seq)
@@ -197,7 +181,7 @@ func TestPrune(t *testing.T) {
 	if err := s.Prune("pr", "ns", 0, 2); err != nil {
 		t.Fatalf("Prune: %v", err)
 	}
-	events, _ := s.LoadChain("pr", "ns")
+	events, _ := s.LoadChain("pr", "ns", nil)
 	if len(events) > 2 {
 		t.Errorf("expected <= 2 after prune, got %d", len(events))
 	}
@@ -209,7 +193,7 @@ func TestPrune_KeepLastZero(t *testing.T) {
 	if err := s.Prune("pr", "ns", 0, 0); err != nil {
 		t.Fatalf("Prune: %v", err)
 	}
-	events, _ := s.LoadChain("pr", "ns")
+	events, _ := s.LoadChain("pr", "ns", nil)
 	if len(events) != 0 {
 		t.Errorf("expected 0 after prune with keepLastN=0, got %d", len(events))
 	}
@@ -221,7 +205,7 @@ func TestPrune_NegativeKeepLast(t *testing.T) {
 	if err := s.Prune("pr", "ns", 0, -5); err != nil {
 		t.Fatalf("Prune: %v", err)
 	}
-	events, _ := s.LoadChain("pr", "ns")
+	events, _ := s.LoadChain("pr", "ns", nil)
 	if len(events) != 0 {
 		t.Errorf("expected 0 after prune with negative keepLastN, got %d", len(events))
 	}
@@ -236,7 +220,7 @@ func TestPrune_MissingBucket(t *testing.T) {
 
 func TestLoadChain_Empty(t *testing.T) {
 	s := newStore(t)
-	events, err := s.LoadChain("x", "y")
+	events, err := s.LoadChain("x", "y", nil)
 	if err != nil || len(events) != 0 {
 		t.Errorf("empty: events=%d err=%v", len(events), err)
 	}
@@ -379,7 +363,7 @@ func TestVerifyHMAC_Invalid(t *testing.T) {
 func TestAppend_Uninitialized(t *testing.T) {
 	s := New(store.NewMemStore(), nil)
 	e := &Event{ID: "test"}
-	err := s.Append("sc", "ns", e)
+	err := s.Append("sc", "ns", e, nil)
 	if err == nil {
 		t.Error("expected error when appending to uninitialized store")
 	}
@@ -403,7 +387,7 @@ func TestVerifyIntegrity_HMACPathCovered(t *testing.T) {
 	e.Checksum = e.ComputeChecksum("")
 	// Don't set HMAC - Append will compute it
 
-	if err := s.Append("sc", "ns", e); err != nil {
+	if err := s.Append("sc", "ns", e, nil); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 
@@ -432,10 +416,10 @@ func TestLoadChain_SortByTimestamp(t *testing.T) {
 			Seq:          0, // Force timestamp-based sort
 		}
 		e.Checksum = e.ComputeChecksum("")
-		_ = s.Append("sc", "ns", e)
+		_ = s.Append("sc", "ns", e, nil)
 	}
 
-	events, err := s.LoadChain("sc", "ns")
+	events, err := s.LoadChain("sc", "ns", nil)
 	if err != nil {
 		t.Fatalf("LoadChain: %v", err)
 	}
@@ -508,12 +492,12 @@ func TestAppend_WithSigningKey(t *testing.T) {
 	}
 	e.Checksum = e.ComputeChecksum("")
 
-	if err := s.Append("sc", "ns", e); err != nil {
+	if err := s.Append("sc", "ns", e, nil); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 
 	// Verify HMAC was set
-	events, _ := s.LoadChain("sc", "ns")
+	events, _ := s.LoadChain("sc", "ns", nil)
 	if len(events) != 1 {
 		t.Fatal("expected 1 event")
 	}
@@ -551,7 +535,7 @@ func TestPrune_WithOldEvents(t *testing.T) {
 			PrevChecksum: "",
 		}
 		e.Checksum = e.ComputeChecksum("")
-		_ = s.Append("pr", "ns", e)
+		_ = s.Append("pr", "ns", e, nil)
 	}
 
 	// Prune events older than 12 hours, keep last 2
@@ -559,7 +543,7 @@ func TestPrune_WithOldEvents(t *testing.T) {
 		t.Fatalf("Prune: %v", err)
 	}
 
-	events, _ := s.LoadChain("pr", "ns")
+	events, _ := s.LoadChain("pr", "ns", nil)
 	// Should have at most 2 events (the keepLastN limit)
 	if len(events) > 2 {
 		t.Errorf("expected <= 2 events after prune, got %d", len(events))

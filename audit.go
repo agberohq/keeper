@@ -8,6 +8,7 @@ import (
 
 	pkgaudit "github.com/agberohq/keeper/pkg/audit"
 	pkgstore "github.com/agberohq/keeper/pkg/store"
+	"github.com/olekukonko/zero"
 	"golang.org/x/crypto/hkdf"
 )
 
@@ -15,11 +16,12 @@ import (
 type AuditEvent = pkgaudit.Event
 
 // auditStore wraps pkg/audit.Store for use within the keeper package.
-// It manages the audit signing key lifecycle: the key is derived from
-// the master key after UnlockDatabase and cleared on Lock.
+// It manages both the audit signing key and the audit encryption key lifecycles:
+// both are derived from the master key after UnlockDatabase and cleared on Lock.
 type auditStore struct {
-	db    pkgstore.Store
-	inner *pkgaudit.Store
+	db     pkgstore.Store
+	inner  *pkgaudit.Store
+	encKey []byte // auditEncKey; nil when locked
 }
 
 func newAuditStore(db pkgstore.Store) *auditStore {
@@ -34,6 +36,19 @@ func newAuditStore(db pkgstore.Store) *auditStore {
 // The caller is responsible for zeroing key after this call.
 func (a *auditStore) setSigningKey(key []byte) {
 	a.inner.SetSigningKey(key)
+}
+
+// setEncKey sets the audit field encryption key.
+// Pass nil to disable encryption (called from Lock).
+func (a *auditStore) setEncKey(key []byte) {
+	if len(key) == 0 {
+		zero.Bytes(a.encKey)
+		a.encKey = nil
+		return
+	}
+	cp := make([]byte, len(key))
+	copy(cp, key)
+	a.encKey = cp
 }
 
 // deriveAuditKey produces a 32-byte HMAC signing key from the master key.
@@ -56,11 +71,11 @@ func (a *auditStore) init() error {
 }
 
 func (a *auditStore) appendEvent(scheme, namespace string, event *BucketEvent) error {
-	return a.inner.Append(scheme, namespace, event)
+	return a.inner.Append(scheme, namespace, event, a.encKey)
 }
 
 func (a *auditStore) loadChain(scheme, namespace string) ([]*BucketEvent, error) {
-	return a.inner.LoadChain(scheme, namespace)
+	return a.inner.LoadChain(scheme, namespace, a.encKey)
 }
 
 func (a *auditStore) pruneEvents(scheme, namespace string, olderThan time.Duration, keepLastN int) error {

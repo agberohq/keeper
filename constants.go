@@ -46,6 +46,8 @@ const (
 	hkdfInfoMetaKey    = "keeper-metadata-v1"
 	hkdfInfoPolicyHMAC = "keeper-policy-hmac-v1"
 	hkdfInfoBucketDEK  = "keeper-bucket-dek-v1"
+	hkdfInfoPolicyEnc  = "keeper-policy-enc-v1"
+	hkdfInfoAuditEnc   = "keeper-audit-enc-v1"
 )
 
 // Bucket DEK migration keys stored in the metadata bucket.

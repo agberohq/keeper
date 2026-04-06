@@ -440,7 +440,7 @@ func TestCompareAndSwap(t *testing.T) {
 	if string(v) != "updated" {
 		t.Errorf("after CAS: %q", v)
 	}
-	if err := store.CompareAndSwap("k", []byte("wrong"), []byte("x")); !errors.Is(err, ErrCASConflict) {
+	if err := store.CompareAndSwap("k", []byte("wrong"), []byte("x")); err != ErrCASConflict {
 		t.Errorf("bad old val: want ErrCASConflict, got %v", err)
 	}
 }
@@ -784,6 +784,8 @@ func (c *countingCipher) Decrypt(ct []byte) ([]byte, error) {
 	}
 	return out, nil
 }
+
+func (c *countingCipher) KeySize() int { return 32 }
 
 func BenchmarkSet(b *testing.B) {
 	store, _ := New(Config{DBPath: filepath.Join(b.TempDir(), "s.db")})
