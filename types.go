@@ -46,10 +46,25 @@ var (
 type SecurityLevel string
 
 // SchemeHandler allows custom pre/post processing per scheme.
+// All Pre* hooks run before the operation; returning an error aborts it.
+// All Post* hooks run after a successful commit; their errors are logged
+// but do not roll back the already-committed operation.
 type SchemeHandler interface {
-	PreSet(scheme, namespace, key string, value []byte) ([]byte, error)
+	// Read
+	PreGet(scheme, namespace, key string) error
 	PostGet(scheme, namespace, key string, value []byte) ([]byte, error)
-	OnDelete(scheme, namespace, key string) error
+
+	// Write
+	PreSet(scheme, namespace, key string, value []byte) ([]byte, error)
+	PostSet(scheme, namespace, key string, value []byte)
+
+	// Delete
+	PreDelete(scheme, namespace, key string) error
+	PostDelete(scheme, namespace, key string)
+
+	// Compare-and-swap
+	PreCAS(scheme, namespace, key string, oldValue, newValue []byte) error
+	PostCAS(scheme, namespace, key string, newValue []byte)
 }
 
 // HSMProvider abstracts wrap/unwrap operations for LevelHSM and LevelRemote buckets.
@@ -62,11 +77,29 @@ type HSMProvider interface {
 }
 
 // Hooks injects custom logic at key lifecycle points.
+// All Pre* hooks run before the operation and may abort it by returning an error.
+// All Post* hooks run after a successful commit; returning an error from a Post*
+// hook logs the error but does NOT roll back the already-committed operation.
+// Any hook field left nil is a no-op.
 type Hooks struct {
-	PreSet    func(scheme, namespace, key string, value []byte) ([]byte, error)
-	PostGet   func(scheme, namespace, key string, value []byte) ([]byte, error)
-	PreDelete func(scheme, namespace, key string) error
-	OnAudit   func(action, scheme, namespace, key string, success bool, duration time.Duration)
+	// Read
+	PreGet  func(scheme, namespace, key string) error
+	PostGet func(scheme, namespace, key string, value []byte) ([]byte, error)
+
+	// Write
+	PreSet  func(scheme, namespace, key string, value []byte) ([]byte, error)
+	PostSet func(scheme, namespace, key string, value []byte)
+
+	// Delete
+	PreDelete  func(scheme, namespace, key string) error
+	PostDelete func(scheme, namespace, key string)
+
+	// Compare-and-swap
+	PreCAS  func(scheme, namespace, key string, oldValue, newValue []byte) error
+	PostCAS func(scheme, namespace, key string, newValue []byte)
+
+	// Audit — called after every operation regardless of success.
+	OnAudit func(action, scheme, namespace, key string, success bool, duration time.Duration)
 }
 
 // JackPool is the subset of jack.Pool that keeper uses.

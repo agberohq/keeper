@@ -995,6 +995,21 @@ func (s *Keeper) GetNamespacedFull(scheme, namespace, key string) ([]byte, error
 	}
 	s.mu.RUnlock()
 
+	if s.hooks.PreGet != nil {
+		if err := s.hooks.PreGet(scheme, namespace, key); err != nil {
+			s.metrics.IncrementReadError()
+			s.audit("get", scheme, namespace, key, false, time.Since(start))
+			return nil, err
+		}
+	}
+	if policy, _ := s.policyChain.GetPolicy(scheme, namespace); policy != nil && policy.Handler != nil {
+		if err := policy.Handler.PreGet(scheme, namespace, key); err != nil {
+			s.metrics.IncrementReadError()
+			s.audit("get", scheme, namespace, key, false, time.Since(start))
+			return nil, err
+		}
+	}
+
 	var secret Secret
 	if err := s.db.View(func(tx pkgstore.Tx) error {
 		b := s.getNamespaceBucket(tx, scheme, namespace)
@@ -1208,6 +1223,14 @@ func (s *Keeper) SetNamespacedFull(scheme, namespace, key string, value []byte) 
 	latency := time.Since(start)
 	s.metrics.RecordWriteLatency(latency)
 	s.audit("set", scheme, namespace, key, true, latency)
+
+	if s.hooks.PostSet != nil {
+		s.hooks.PostSet(scheme, namespace, key, value)
+	}
+	if policy, _ := s.policyChain.GetPolicy(scheme, namespace); policy != nil && policy.Handler != nil {
+		policy.Handler.PostSet(scheme, namespace, key, value)
+	}
+
 	return nil
 }
 
@@ -1246,7 +1269,7 @@ func (s *Keeper) DeleteNamespacedFull(scheme, namespace, key string) error {
 		}
 	}
 	if policy, _ := s.policyChain.GetPolicy(scheme, namespace); policy != nil && policy.Handler != nil {
-		if err := policy.Handler.OnDelete(scheme, namespace, key); err != nil {
+		if err := policy.Handler.PreDelete(scheme, namespace, key); err != nil {
 			s.audit("delete", scheme, namespace, key, false, time.Since(start))
 			return err
 		}
@@ -1265,6 +1288,12 @@ func (s *Keeper) DeleteNamespacedFull(scheme, namespace, key string) error {
 	if err == nil {
 		_ = s.policyChain.AppendEvent(scheme, namespace, "key_deleted",
 			map[string]string{"key": key})
+		if s.hooks.PostDelete != nil {
+			s.hooks.PostDelete(scheme, namespace, key)
+		}
+		if policy, _ := s.policyChain.GetPolicy(scheme, namespace); policy != nil && policy.Handler != nil {
+			policy.Handler.PostDelete(scheme, namespace, key)
+		}
 	}
 	s.audit("delete", scheme, namespace, key, err == nil, time.Since(start))
 	return err
@@ -1291,6 +1320,19 @@ func (s *Keeper) CompareAndSwapNamespacedFull(scheme, namespace, key string, old
 	}
 	s.updateActivity()
 	s.mu.RUnlock()
+
+	if s.hooks.PreCAS != nil {
+		if err := s.hooks.PreCAS(scheme, namespace, key, oldValue, newValue); err != nil {
+			s.audit("cas", scheme, namespace, key, false, time.Since(start))
+			return err
+		}
+	}
+	if policy, _ := s.policyChain.GetPolicy(scheme, namespace); policy != nil && policy.Handler != nil {
+		if err := policy.Handler.PreCAS(scheme, namespace, key, oldValue, newValue); err != nil {
+			s.audit("cas", scheme, namespace, key, false, time.Since(start))
+			return err
+		}
+	}
 
 	now := time.Now()
 	err := s.db.Update(func(tx pkgstore.Tx) error {
@@ -1351,6 +1393,14 @@ func (s *Keeper) CompareAndSwapNamespacedFull(scheme, namespace, key string, old
 		return b.Put([]byte(key), nd)
 	})
 	s.audit("cas", scheme, namespace, key, err == nil, time.Since(start))
+	if err == nil {
+		if s.hooks.PostCAS != nil {
+			s.hooks.PostCAS(scheme, namespace, key, newValue)
+		}
+		if policy, _ := s.policyChain.GetPolicy(scheme, namespace); policy != nil && policy.Handler != nil {
+			policy.Handler.PostCAS(scheme, namespace, key, newValue)
+		}
+	}
 	return err
 }
 
