@@ -1,15 +1,13 @@
-package hsm_test
+package hsm
 
 import (
 	"bytes"
 	"context"
 	"testing"
-
-	"github.com/agberohq/keeper/pkg/hsm"
 )
 
 func TestSoftHSM_RoundTrip(t *testing.T) {
-	h, err := hsm.NewSoftHSM()
+	h, err := NewSoftHSM()
 	if err != nil {
 		t.Fatalf("NewSoftHSM: %v", err)
 	}
@@ -31,7 +29,7 @@ func TestSoftHSM_RoundTrip(t *testing.T) {
 }
 
 func TestSoftHSM_NonceUnique(t *testing.T) {
-	h, err := hsm.NewSoftHSM()
+	h, err := NewSoftHSM()
 	if err != nil {
 		t.Fatalf("NewSoftHSM: %v", err)
 	}
@@ -44,7 +42,7 @@ func TestSoftHSM_NonceUnique(t *testing.T) {
 }
 
 func TestSoftHSM_Ping(t *testing.T) {
-	h, err := hsm.NewSoftHSM()
+	h, err := NewSoftHSM()
 	if err != nil {
 		t.Fatalf("NewSoftHSM: %v", err)
 	}
@@ -54,7 +52,7 @@ func TestSoftHSM_Ping(t *testing.T) {
 }
 
 func TestSoftHSM_TamperedCiphertext(t *testing.T) {
-	h, err := hsm.NewSoftHSM()
+	h, err := NewSoftHSM()
 	if err != nil {
 		t.Fatalf("NewSoftHSM: %v", err)
 	}

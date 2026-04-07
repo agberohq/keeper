@@ -1,8 +1,8 @@
 # keeper CLI
 
 A terminal interface to a keeper encrypted secret store. Secrets are encrypted
-at rest and stored in a local database. The passphrase never appears as a command-line argument and is never
-written to disk.
+at rest and stored in a local bbolt database. The passphrase never appears as a
+command-line argument and is never written to disk.
 
 ---
 
@@ -26,6 +26,22 @@ go install ./cmd/keeper      # binary in $GOBIN
 
 ---
 
+## Key format
+
+Keeper uses a `scheme://namespace/key` addressing model. Every secret lives in
+a named bucket identified by its scheme and namespace:
+
+```
+ss://tmp/name          scheme=ss, namespace=tmp, key=name
+vault://system/jwt     scheme=vault, namespace=system, key=jwt
+certs://web/tls.crt    scheme=certs, namespace=web, key=tls.crt
+```
+
+You can also use bare keys (no `://`), in which case keeper routes them to the
+default bucket. All `ls`, `get`, `set`, and `delete` commands accept both forms.
+
+---
+
 ## Database location
 
 The CLI resolves the database path in this order:
@@ -33,13 +49,12 @@ The CLI resolves the database path in this order:
 1. `--db <path>` flag
 2. `KEEPER_DB` environment variable
 3. A single `*.db` file found in the current directory (auto-selected)
-4. Multiple `*.db` files found — a numbered menu lets you pick one
-5. No `*.db` files found — `keeper.db` in the current directory is offered
-   for creation (requires confirmation)
+4. Multiple `*.db` files — a numbered menu lets you pick one
+5. No `*.db` files — `keeper.db` in the current directory is offered for
+   creation (requires confirmation)
 
 When a new database is created the CLI prompts for a passphrase with
-confirmation before writing anything to disk. The first `Unlock` call sets the
-verification hash — whatever you type becomes the permanent passphrase.
+confirmation before writing anything to disk.
 
 ---
 
@@ -75,8 +90,11 @@ keeper [--db <path>] <command> [args]
 ### Examples
 
 ```sh
-# Store a secret
-keeper set vault://system/jwt_secret "supersecret"
+# Store a secret (value on command line)
+keeper set ss://tmp/name john
+
+# Store a secret (value prompted with no echo)
+keeper set vault://system/jwt_secret
 
 # Read it back
 keeper get vault://system/jwt_secret
@@ -87,8 +105,20 @@ keeper set certs://web/tls.crt --file ./tls.crt
 # Store a base64-encoded value
 keeper set vault://system/aes_key --base64 "$(base64 < /dev/urandom | head -c 44)"
 
-# List all keys
+# List all keys (output: scheme://namespace/key)
 keeper ls
+
+# List keys in a specific scheme
+keeper ls vault
+
+# List keys in a specific bucket
+keeper ls vault system
+
+# Delete a key
+keeper delete ss://tmp/name
+
+# Delete without confirmation prompt
+keeper delete --force ss://tmp/name
 
 # Backup
 keeper backup --out /var/backup/keeper-$(date +%Y%m%d).db
@@ -109,20 +139,34 @@ between commands.
 $ keeper
 keeper — ./keeper.db  (help for commands, quit to exit)
 
-keeper> ls
-  store is empty
+keeper> set ss://tmp/name john
+✓ stored "ss://tmp/name" (4 bytes)
 
-keeper> set jwt_secret
-Value for jwt_secret (hidden):
-✓ stored "jwt_secret" (32 bytes)
+keeper> set vault://system/jwt_secret
+Value for vault://system/jwt_secret (hidden):
+✓ stored "vault://system/jwt_secret" (32 bytes)
 
 keeper> ls
 Key
-──────────────────────────────
-jwt_secret
+──────────────────────────────────────
+ss://tmp/name
+vault://system/jwt_secret
 
-keeper> get jwt_secret
-jwt_secret: supersecret
+keeper> get ss://tmp/name
+ss://tmp/name: john
+
+keeper> get "vault://system/jwt_secret"
+vault://system/jwt_secret: supersecret
+
+keeper> ls ss
+Key
+──────────────────────────
+ss://tmp/name
+
+keeper> ls vault system
+Key
+──────────────────────────────────────
+jwt_secret
 
 keeper> status
   store is unlocked
@@ -148,9 +192,9 @@ bye
 
 | Command | Aliases | Description |
 |---|---|---|
-| `ls` | `list` | List all keys |
+| `ls [scheme] [ns]` | `list` | List keys — all, by scheme, or by bucket |
 | `get <key>` | `cat <key>` | Print a secret value |
-| `set <key>` | `put <key>` | Store a secret (value prompted with no echo) |
+| `set <key> [value]` | `put <key> [value]` | Store a secret. Omit value to prompt with no echo |
 | `delete <key>` | `rm`, `del` | Remove a key (asks for confirmation) |
 | `status` | | Show live lock state |
 | `lock` | | Drop keys from memory (store stays open) |
@@ -164,21 +208,46 @@ bye
 
 ### Notes on secret values in the REPL
 
-`set <key>` prompts for the value with **no echo** using `term.ReadPassword`.
-The value is never written to:
+`set <key>` without an inline value prompts for it with **no echo** using
+`term.ReadPassword`. The value is never written to terminal scrollback, shell
+history, or `ps` output.
 
-- terminal scrollback
-- shell history (`~/.bash_history`, `~/.zsh_history`)
-- process argument list (`ps aux`)
+`set <key> <value>` accepts an inline value directly — useful for non-sensitive
+data or when piping from scripts. Multiple words are joined with a space, so
+`set key hello world` stores `"hello world"`.
 
-This is why `set` takes only the key on the command line. The value is always
-read interactively.
+Surrounding quotes are stripped from arguments, so `get "vault://system/key"`
+and `get vault://system/key` are identical.
 
 ### Muscle-memory convenience
 
-If you type `keeper ls` inside the REPL (forgetting you are already in a
-session) the leading `keeper` token is silently stripped and `ls` runs
-normally.
+If you type `keeper ls` inside the REPL the leading `keeper` token is silently
+stripped and `ls` runs normally.
+
+---
+
+## Encryption model
+
+Keeper uses a layered encryption model:
+
+| Layer | What is encrypted | Key |
+|---|---|---|
+| Secret values | Every secret value | Per-bucket DEK derived from master key |
+| Bucket policies | Scheme, namespace, security level, wrapped DEKs | `policyEncKey` (HKDF from master) |
+| Audit events | Scheme, namespace, details fields | `auditEncKey` (HKDF from master) |
+| Audit HMAC | Tamper-evidence tag on every event | Audit signing key (HKDF from master) |
+
+The master key is derived from your passphrase using Argon2id with a random
+salt stored in the database. All encryption uses XChaCha20-Poly1305 by default
+(AES-256-GCM in FIPS mode). Nonces are random and never reused.
+
+### Security levels
+
+| Level | Description |
+|---|---|
+| `LevelPasswordOnly` | DEK derived from master key — unlocks automatically at `Unlock` |
+| `LevelAdminWrapped` | DEK wrapped per-admin with Argon2id KEK — requires `UnlockBucket` |
+| `LevelHSM` / `LevelRemote` | DEK managed by an external HSM or remote provider |
 
 ---
 
@@ -199,3 +268,8 @@ generates a new Argon2id salt, re-derives the master key, and re-encrypts all
 
 **Backup before rotation.** `backup` streams a consistent bbolt snapshot.
 Always take a backup before `rotate` or `rotate-salt` in production.
+
+**Audit chain integrity.** Every operation is appended to an immutable
+per-bucket audit chain. The chain can be verified without decryption by anyone
+with access to the database file. Holders of the audit key can also verify
+HMAC signatures and decrypt event details.

@@ -1,4 +1,4 @@
-package keepcmd_test
+package keepcmd
 
 import (
 	"os"
@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/agberohq/keeper"
-	"github.com/agberohq/keeper/x/keepcmd"
 )
 
 // bufOut captures Output calls for assertion in tests.
@@ -36,11 +35,11 @@ func (b *bufOut) contains(s string) bool {
 
 // newTestCommands returns Commands backed by a fresh unlocked store.
 // NoClose is false — each operation opens and closes the store (one-shot mode).
-func newTestCommands(t *testing.T) (*keepcmd.Commands, *bufOut) {
+func newTestCommands(t *testing.T) (*Commands, *bufOut) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 	out := &bufOut{}
-	cmds := &keepcmd.Commands{
+	cmds := &Commands{
 		Store: func() (*keeper.Keeper, error) {
 			s, err := keeper.New(keeper.Config{DBPath: dbPath})
 			if err != nil {
@@ -60,7 +59,7 @@ func newTestCommands(t *testing.T) (*keepcmd.Commands, *bufOut) {
 // newSessionCommands returns Commands backed by a shared open store.
 // NoClose is true — simulates the REPL session where the store must not be
 // closed between commands.
-func newSessionCommands(t *testing.T) (*keepcmd.Commands, *bufOut, func()) {
+func newSessionCommands(t *testing.T) (*Commands, *bufOut, func()) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "session.db")
 	store, err := keeper.New(keeper.Config{DBPath: dbPath})
@@ -72,7 +71,7 @@ func newSessionCommands(t *testing.T) (*keepcmd.Commands, *bufOut, func()) {
 		t.Fatalf("Unlock: %v", err)
 	}
 	out := &bufOut{}
-	cmds := &keepcmd.Commands{
+	cmds := &Commands{
 		Store:   func() (*keeper.Keeper, error) { return store, nil },
 		Out:     out,
 		NoClose: true,
@@ -93,7 +92,7 @@ func TestCommands_ListEmpty(t *testing.T) {
 func TestCommands_SetAndGet(t *testing.T) {
 	cmds, out := newTestCommands(t)
 
-	if err := cmds.Set("mykey", "myvalue", keepcmd.SetOptions{}); err != nil {
+	if err := cmds.Set("mykey", "myvalue", SetOptions{}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 	if !out.contains("mykey") {
@@ -112,7 +111,7 @@ func TestCommands_SetAndGet(t *testing.T) {
 func TestCommands_SetBase64(t *testing.T) {
 	cmds, _ := newTestCommands(t)
 	// "hello" in standard base64 is "aGVsbG8="
-	if err := cmds.Set("b64key", "aGVsbG8=", keepcmd.SetOptions{Base64: true}); err != nil {
+	if err := cmds.Set("b64key", "aGVsbG8=", SetOptions{Base64: true}); err != nil {
 		t.Fatalf("Set base64: %v", err)
 	}
 }
@@ -123,7 +122,7 @@ func TestCommands_SetFromFile(t *testing.T) {
 	if err := os.WriteFile(f, []byte("file-content"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := cmds.Set("filekey", "", keepcmd.SetOptions{FromFile: f}); err != nil {
+	if err := cmds.Set("filekey", "", SetOptions{FromFile: f}); err != nil {
 		t.Fatalf("Set from file: %v", err)
 	}
 	if !out.contains("12 bytes") {
@@ -133,8 +132,8 @@ func TestCommands_SetFromFile(t *testing.T) {
 
 func TestCommands_ListAfterSet(t *testing.T) {
 	cmds, out := newTestCommands(t)
-	cmds.Set("a", "1", keepcmd.SetOptions{})
-	cmds.Set("b", "2", keepcmd.SetOptions{})
+	cmds.Set("a", "1", SetOptions{})
+	cmds.Set("b", "2", SetOptions{})
 
 	out.lines = nil
 	if err := cmds.List(); err != nil {
@@ -147,7 +146,7 @@ func TestCommands_ListAfterSet(t *testing.T) {
 
 func TestCommands_Delete(t *testing.T) {
 	cmds, out := newTestCommands(t)
-	cmds.Set("delkey", "val", keepcmd.SetOptions{})
+	cmds.Set("delkey", "val", SetOptions{})
 
 	out.lines = nil
 	if err := cmds.Delete("delkey"); err != nil {
@@ -171,7 +170,7 @@ func TestCommands_DeleteMissing(t *testing.T) {
 
 func TestCommands_SetEmptyKey(t *testing.T) {
 	cmds, _ := newTestCommands(t)
-	if err := cmds.Set("", "value", keepcmd.SetOptions{}); err == nil {
+	if err := cmds.Set("", "value", SetOptions{}); err == nil {
 		t.Error("expected error for empty key")
 	}
 }
@@ -195,10 +194,10 @@ func TestCommands_Status(t *testing.T) {
 
 func TestCommands_Backup(t *testing.T) {
 	cmds, out := newTestCommands(t)
-	cmds.Set("bk", "val", keepcmd.SetOptions{})
+	cmds.Set("bk", "val", SetOptions{})
 
 	dest := filepath.Join(t.TempDir(), "backup.db")
-	if err := cmds.Backup(keepcmd.BackupOptions{Dest: dest}); err != nil {
+	if err := cmds.Backup(BackupOptions{Dest: dest}); err != nil {
 		t.Fatalf("Backup: %v", err)
 	}
 	if !out.contains("backup written") {
@@ -220,7 +219,7 @@ func TestCommands_BackupGeneratedName(t *testing.T) {
 	os.Chdir(tmp)
 	defer os.Chdir(orig)
 
-	if err := cmds.Backup(keepcmd.BackupOptions{}); err != nil {
+	if err := cmds.Backup(BackupOptions{}); err != nil {
 		t.Fatalf("Backup (auto name): %v", err)
 	}
 	entries, _ := os.ReadDir(tmp)
@@ -231,7 +230,7 @@ func TestCommands_BackupGeneratedName(t *testing.T) {
 
 func TestCommands_Rotate(t *testing.T) {
 	cmds, out := newTestCommands(t)
-	cmds.Set("rk", "rv", keepcmd.SetOptions{})
+	cmds.Set("rk", "rv", SetOptions{})
 
 	if err := cmds.Rotate([]byte("newpass")); err != nil {
 		t.Fatalf("Rotate: %v", err)
@@ -253,7 +252,7 @@ func TestCommands_RotateEmptyPassphrase(t *testing.T) {
 
 func TestCommands_RotateSalt(t *testing.T) {
 	cmds, out := newTestCommands(t)
-	cmds.Set("sk", "sv", keepcmd.SetOptions{})
+	cmds.Set("sk", "sv", SetOptions{})
 
 	if err := cmds.RotateSalt([]byte("testpass")); err != nil {
 		t.Fatalf("RotateSalt: %v", err)
@@ -280,10 +279,10 @@ func TestNoClose_StoreRemainsOpenAcrossOperations(t *testing.T) {
 	defer close()
 
 	// Multiple operations without re-opening between them.
-	if err := cmds.Set("sk1", "sv1", keepcmd.SetOptions{}); err != nil {
+	if err := cmds.Set("sk1", "sv1", SetOptions{}); err != nil {
 		t.Fatalf("Set 1: %v", err)
 	}
-	if err := cmds.Set("sk2", "sv2", keepcmd.SetOptions{}); err != nil {
+	if err := cmds.Set("sk2", "sv2", SetOptions{}); err != nil {
 		t.Fatalf("Set 2 (would fail if store was closed): %v", err)
 	}
 	if err := cmds.Get("sk1"); err != nil {
@@ -304,7 +303,7 @@ func TestNoClose_StoreRemainsOpenAcrossOperations(t *testing.T) {
 // (the default) still works correctly for one-shot commands.
 func TestNoClose_False_DefaultBehaviourUnchanged(t *testing.T) {
 	cmds, out := newTestCommands(t)
-	if err := cmds.Set("k", "v", keepcmd.SetOptions{}); err != nil {
+	if err := cmds.Set("k", "v", SetOptions{}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 	// A second call re-opens via StoreFactory — this must succeed.

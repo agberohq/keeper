@@ -11,9 +11,9 @@ import (
 //
 // Every unlocked bucket has exactly one entry here. The DEK is sealed inside
 // a memguard Enclave which:
-//   - mlocks the memory so the OS never pages it to disk
-//   - mprotects the pages read-only when not in active use
-//   - zeros the memory on release
+// mlocks the memory so the OS never pages it to disk
+// mprotects the pages read-only when not in active use
+// zeros the memory on release
 //
 // Replaces the previous plain-map bucketKeys — Go's GC gave no guarantee
 // that key bytes would ever be zeroed.
@@ -128,4 +128,45 @@ func (e *Envelope) HeldKeys() []string {
 
 func envelopeKey(scheme, namespace string) string {
 	return scheme + ":" + namespace
+}
+
+// envelopeOldKey returns the secondary map key used to store the pre-migration
+// DEK (master key used directly) alongside the new derived DEK.
+func envelopeOldKey(scheme, namespace string) string {
+	return scheme + ":" + namespace + ":__old__"
+}
+
+// HoldOld stores the pre-migration DEK (old master-key-as-DEK) under a
+// secondary key. Used during the background migration window so that records
+// written before the migration can still be decrypted.
+// buf is sealed (and destroyed) by this call.
+func (e *Envelope) HoldOld(scheme, namespace string, buf *memguard.LockedBuffer) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.deks[envelopeOldKey(scheme, namespace)] = buf.Seal()
+}
+
+// RetrieveOld returns the pre-migration DEK for scheme/namespace.
+// Returns ErrBucketLocked when no old key is present (migration complete or
+// not started). The caller MUST call buf.Destroy() when done.
+func (e *Envelope) RetrieveOld(scheme, namespace string) (*memguard.LockedBuffer, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	enc, ok := e.deks[envelopeOldKey(scheme, namespace)]
+	if !ok {
+		return nil, ErrBucketLocked
+	}
+	buf, err := enc.Open()
+	if err != nil {
+		return nil, fmt.Errorf("envelope: failed to open old enclave for %s:%s: %w", scheme, namespace, err)
+	}
+	return buf, nil
+}
+
+// DropOld removes the pre-migration fallback DEK for a single bucket.
+// Called after all records in a bucket have been migrated.
+func (e *Envelope) DropOld(scheme, namespace string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.deks, envelopeOldKey(scheme, namespace))
 }

@@ -1,7 +1,3 @@
-// Package keephandler provides a router-agnostic HTTP handler that mounts
-// keeper secret management endpoints onto any net/http compatible mux.
-// Authentication and access control are entirely the caller's responsibility —
-// apply middleware or use WithGuard / WithHooks before or after calling Mount.
 package keephandler
 
 import (
@@ -188,9 +184,9 @@ type Hook struct {
 // ResponseEncoder writes the HTTP response for a route. It is called by every
 // route handler instead of the built-in jsonOK / jsonError.
 //
-//   - route is one of the RouteXxx constants.
-//   - status is the intended HTTP status code.
-//   - data is the payload; for errors it is map[string]string{"error": msg}.
+// route is one of the RouteXxx constants.
+// status is the intended HTTP status code.
+// data is the payload; for errors it is map[string]string{"error": msg}.
 //
 // The encoder is responsible for setting Content-Type, writing the status
 // code, and writing the body. The default encoder writes flat JSON.

@@ -54,16 +54,32 @@ type Keeper struct {
 	defaultNs      string
 	metrics        *core.Metrics
 	schemeRegistry map[string]*BucketSecurityPolicy
+	registryMu     sync.RWMutex // protects schemeRegistry independently of s.mu
 	hooks          Hooks
 	envelope       *Envelope
 	auditStore     *auditStore
 	policyChain    *Chain
 	policyKey      []byte // HMAC key for policy authentication; nil when locked
+	policyEncKey   []byte // encryption key for policy/WAL/SaltStore; nil when locked
+	auditEncKey    []byte // encryption key for audit Scheme/Namespace/Details; nil when locked
 
 	// Jack-managed background components; nil when running without Jack.
-	autoLocker     *jack.Looper
-	jackReaper     *jack.Reaper
-	pruneScheduler *jack.Scheduler
+	autoLocker      *jack.Looper
+	jackReaper      *jack.Reaper
+	pruneScheduler  *jack.Scheduler
+	migrationLooper *jack.Looper
+
+	// migrationState tracks the per-bucket DEK derivation migration.
+	// Accessed atomically: 0=NotNeeded, 1=InProgress, 2=Done.
+	migrationState int32
+
+	// migrationStopCh is closed by Lock()/Close() to signal the migration
+	// watcher goroutine to stop. migrationStoppedCh is closed by the watcher
+	// after looper.Stop() returns, allowing Lock() to wait for full drain.
+	// Lock() must never call looper.Stop() directly — jack's Stop() can
+	// deadlock if called concurrently with an already-in-progress Stop().
+	migrationStopCh    chan struct{}
+	migrationStoppedCh chan struct{}
 
 	// doctor is the jack.Doctor instance monitoring DB and encryption health.
 	// doctorOwned is true when Keeper created it (not provided via JackConfig).
@@ -226,7 +242,10 @@ func (s *Keeper) CreateBucket(scheme, namespace string, level SecurityLevel, cre
 		// Caller must have set the HSMProvider on the policy before calling CreateBucket.
 		// We retrieve it from the registry if the caller registered it there first.
 		if policy.HSMProvider == nil {
-			if reg, ok := s.schemeRegistry[scheme+":"+namespace]; ok {
+			s.registryMu.RLock()
+			reg, ok := s.schemeRegistry[scheme+":"+namespace]
+			s.registryMu.RUnlock()
+			if ok {
 				policy.HSMProvider = reg.HSMProvider
 			}
 		}
@@ -267,6 +286,16 @@ func (s *Keeper) CreateBucket(scheme, namespace string, level SecurityLevel, cre
 		return err
 	}
 
+	// For LevelPasswordOnly, schemeRegistry is not populated by unlockBucketPasswordOnly
+	// (which only seeds the envelope). Populate it explicitly here so that
+	// RegisterBucketHandler and other registry lookups work immediately after
+	// CreateBucket returns, consistent with LevelAdminWrapped and LevelHSM.
+	if level == LevelPasswordOnly {
+		s.registryMu.Lock()
+		s.schemeRegistry[fmt.Sprintf("%s:%s", scheme, namespace)] = policy
+		s.registryMu.Unlock()
+	}
+
 	// Seed the Envelope immediately for LevelPasswordOnly buckets created
 	// while the store is already unlocked.
 	if !s.locked && level == LevelPasswordOnly {
@@ -286,6 +315,47 @@ func (s *Keeper) CreateBucket(scheme, namespace string, level SecurityLevel, cre
 	return nil
 }
 
+// EnsureBucket creates a LevelPasswordOnly bucket for the scheme and namespace
+// parsed from key, if one does not already exist. It is idempotent:
+// ErrPolicyImmutable (bucket already exists) is silently ignored.
+//
+// This is the correct primitive for CLI and keepcmd operations that should work
+// across any scheme/namespace without requiring an explicit CreateBucket call.
+// It deliberately does not create LevelAdminWrapped or LevelHSM buckets —
+// those require explicit operator intent.
+func (s *Keeper) EnsureBucket(key string) error {
+	scheme, namespace, _ := parseKeyExtended(key)
+	// Nothing to do for the default namespace — it is always seeded at unlock.
+	if scheme == "" || namespace == "" || namespace == s.defaultNs {
+		return nil
+	}
+	err := s.CreateBucket(scheme, namespace, LevelPasswordOnly, "auto")
+	if err == nil || err == ErrPolicyImmutable {
+		return nil
+	}
+	return err
+}
+
+// RegisterBucketHandler attaches a SchemeHandler to an existing bucket policy
+// in the registry. The handler is called for every Pre*/Post* operation on
+// that bucket. It is excluded from serialisation — callers must register it
+// after Open (and after UnlockDatabase for LevelAdminWrapped buckets).
+// Returns ErrPolicyNotFound if the bucket does not exist.
+func (s *Keeper) RegisterBucketHandler(scheme, namespace string, handler SchemeHandler) error {
+	if handler == nil {
+		return nil
+	}
+	key := scheme + ":" + namespace
+	s.registryMu.Lock()
+	defer s.registryMu.Unlock()
+	policy, ok := s.schemeRegistry[key]
+	if !ok {
+		return ErrPolicyNotFound
+	}
+	policy.Handler = handler
+	return nil
+}
+
 // RegisterHSMProvider attaches an HSMProvider to an existing LevelHSM or LevelRemote
 // policy in the registry. This must be called after Open and before UnlockDatabase
 // so the provider is available when the bucket is automatically unlocked.
@@ -297,7 +367,9 @@ func (s *Keeper) RegisterHSMProvider(scheme, namespace string, provider HSMProvi
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := scheme + ":" + namespace
+	s.registryMu.Lock()
 	policy, ok := s.schemeRegistry[key]
+	s.registryMu.Unlock()
 	if !ok {
 		return ErrPolicyNotFound
 	}
@@ -358,7 +430,9 @@ func (s *Keeper) AddAdminToPolicy(scheme, namespace, adminID string, adminPasswo
 	if err := s.savePolicy(policy); err != nil {
 		return err
 	}
+	s.registryMu.Lock()
 	s.schemeRegistry[fmt.Sprintf("%s:%s", scheme, namespace)] = policy
+	s.registryMu.Unlock()
 
 	// First admin: seed the Envelope so the bucket is usable immediately.
 	if len(policy.WrappedDEKs) == 1 {
@@ -397,7 +471,9 @@ func (s *Keeper) RevokeAdmin(scheme, namespace, adminID string) error {
 	if err := s.savePolicy(policy); err != nil {
 		return err
 	}
+	s.registryMu.Lock()
 	s.schemeRegistry[fmt.Sprintf("%s:%s", scheme, namespace)] = policy
+	s.registryMu.Unlock()
 	_ = s.policyChain.AppendEvent(scheme, namespace, "admin_revoked",
 		map[string]string{"admin": adminID})
 	return nil
@@ -518,6 +594,51 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 	}
 	s.policyKey = policyKey
 
+	// Derive metadata encryption keys (policy/WAL/SaltStore and audit fields).
+	masterBytes3, err := master.Bytes()
+	if err != nil {
+		s.locked = true
+		s.master = nil
+		s.auditStore.setSigningKey(nil)
+		zero.Bytes(s.policyKey)
+		s.policyKey = nil
+		return fmt.Errorf("failed to read master key for metadata key derivation: %w", err)
+	}
+	policyEncKey, auditEncKey, err := deriveMetadataKeys(masterBytes3, s.config)
+	zero.Bytes(masterBytes3)
+	if err != nil {
+		s.locked = true
+		s.master = nil
+		s.auditStore.setSigningKey(nil)
+		zero.Bytes(s.policyKey)
+		s.policyKey = nil
+		return fmt.Errorf("failed to derive metadata encryption keys: %w", err)
+	}
+	s.policyEncKey = policyEncKey
+	s.auditEncKey = auditEncKey
+	s.auditStore.setEncKey(auditEncKey)
+
+	// Re-populate schemeRegistry now that policyEncKey is available.
+	// The initial loadPolicies() call in New() runs before unlock so it
+	// cannot decrypt encrypted policy values. We clear and reload here so
+	// all policies are fully decoded before bucket seeding proceeds.
+	s.registryMu.Lock()
+	s.schemeRegistry = make(map[string]*BucketSecurityPolicy)
+	s.registryMu.Unlock()
+	if err := s.loadPolicies(); err != nil {
+		s.locked = true
+		s.master = nil
+		s.auditStore.setSigningKey(nil)
+		s.auditStore.setEncKey(nil)
+		zero.Bytes(s.policyKey)
+		s.policyKey = nil
+		zero.Bytes(s.policyEncKey)
+		s.policyEncKey = nil
+		zero.Bytes(s.auditEncKey)
+		s.auditEncKey = nil
+		return fmt.Errorf("failed to load policies after unlock: %w", err)
+	}
+
 	// If a rotation was interrupted by a crash, complete it now.
 	// The master key has been verified, so we know it is the new key.
 	if s.hasIncompleteRotation() {
@@ -526,8 +647,13 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 			s.locked = true
 			s.master = nil
 			s.auditStore.setSigningKey(nil)
+			s.auditStore.setEncKey(nil)
 			zero.Bytes(s.policyKey)
 			s.policyKey = nil
+			zero.Bytes(s.policyEncKey)
+			s.policyEncKey = nil
+			zero.Bytes(s.auditEncKey)
+			s.auditEncKey = nil
 			return fmt.Errorf("failed to read master key for rotation resume: %w", rerr)
 		}
 		if rerr := s.resumeRotation(masterBytesForResume); rerr != nil {
@@ -535,8 +661,13 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 			s.locked = true
 			s.master = nil
 			s.auditStore.setSigningKey(nil)
+			s.auditStore.setEncKey(nil)
 			zero.Bytes(s.policyKey)
 			s.policyKey = nil
+			zero.Bytes(s.policyEncKey)
+			s.policyEncKey = nil
+			zero.Bytes(s.auditEncKey)
+			s.auditEncKey = nil
 			return fmt.Errorf("failed to resume interrupted rotation: %w", rerr)
 		}
 		zero.Bytes(masterBytesForResume)
@@ -548,27 +679,26 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 		s.logger.Fields("err", err).Warn("policy HMAC upgrade failed — continuing")
 	}
 
-	// Seed all LevelPasswordOnly buckets.
+	// Seed all LevelPasswordOnly buckets by reading directly from the on-disk
+	// _policies_ bucket. This is authoritative: it does not rely on schemeRegistry
+	// being fully populated (which requires an in-memory round-trip through
+	// loadPolicies that can silently miss entries in some environments).
+	// The default bucket is always seeded first; remaining buckets follow.
 	if err := s.unlockBucketPasswordOnly(s.defaultScheme, s.defaultNs); err != nil {
 		s.locked = true
 		s.master = nil
 		s.auditStore.setSigningKey(nil)
+		s.auditStore.setEncKey(nil)
+		zero.Bytes(s.policyKey)
+		s.policyKey = nil
+		zero.Bytes(s.policyEncKey)
+		s.policyEncKey = nil
+		zero.Bytes(s.auditEncKey)
+		s.auditEncKey = nil
 		return fmt.Errorf("failed to unlock default bucket: %w", err)
 	}
-	for _, policy := range s.schemeRegistry {
-		switch policy.Level {
-		case LevelPasswordOnly:
-			if err := s.unlockBucketPasswordOnly(policy.Scheme, policy.Namespace); err != nil {
-				s.audit("unlock_bucket_failed", policy.Scheme, policy.Namespace, "", false, 0)
-			}
-		case LevelHSM, LevelRemote:
-			if policy.HSMProvider != nil {
-				if err := s.unlockBucketHSM(policy.Scheme, policy.Namespace); err != nil {
-					s.logger.Fields("scheme", policy.Scheme, "namespace", policy.Namespace, "err", err).Warn("HSM bucket unlock failed — bucket remains locked")
-					s.audit("unlock_hsm_bucket_failed", policy.Scheme, policy.Namespace, "", false, 0)
-				}
-			}
-		}
+	if err := s.seedAllBucketsFromDisk(); err != nil {
+		s.logger.Fields("err", err).Warn("bucket seeding from disk encountered errors — some buckets may require explicit unlock")
 	}
 
 	s.updateActivity()
@@ -584,7 +714,9 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 				if time.Since(last) > interval {
 					s.mu.Lock()
 					if !s.locked {
+						s.registryMu.RLock()
 						s.envelope.DropAdminWrapped(s.schemeRegistry)
+						s.registryMu.RUnlock()
 						s.audit("auto_lock_admin_wrapped", "", "", "", true, 0)
 					}
 					s.mu.Unlock()
@@ -621,9 +753,117 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 	// Start jack.Doctor health patients for DB latency and encryption.
 	s.startHealthPatients()
 
+	// Start per-bucket DEK derivation migration if needed.
+	s.startDEKMigration()
+
 	s.logger.Fields("defaultScheme", s.defaultScheme, "defaultNs", s.defaultNs).Info("store unlocked")
 	s.audit("unlock_database", "", "", "", true, 0)
 	return nil
+}
+
+// MigrationStatus reports the current state of the per-bucket DEK derivation
+// migration. Safe to call from any goroutine.
+func (s *Keeper) MigrationStatus() MigrationState {
+	return MigrationState(atomic.LoadInt32(&s.migrationState))
+}
+
+// startDEKMigration checks whether per-bucket DEK derivation migration is
+// needed and, if so, seeds the migrationState and starts the background looper.
+//
+// Called from UnlockDatabase after all buckets are seeded. Holds no locks —
+// the store is already unlocked at this point.
+func (s *Keeper) startDEKMigration() {
+	// Check the completion marker — O(1) metadata read.
+	done := false
+	_ = s.db.View(func(tx pkgstore.Tx) error {
+		b := tx.Bucket([]byte(metaBucket))
+		if b != nil && b.Get([]byte(metaBucketDEKDoneKey)) != nil {
+			done = true
+		}
+		return nil
+	})
+	if done {
+		atomic.StoreInt32(&s.migrationState, int32(MigrationNotNeeded))
+		s.logger.Debug("bucket DEK migration: already complete")
+		return
+	}
+
+	atomic.StoreInt32(&s.migrationState, int32(MigrationInProgress))
+
+	// Seed the old master-key-as-DEK into the envelope for every
+	// LevelPasswordOnly bucket so unmigrated records can still be decrypted.
+	seedOld := func(scheme, namespace string) {
+		mb, err := s.master.Bytes()
+		if err != nil {
+			return
+		}
+		buf := memguard.NewBufferFromBytes(mb) // copies and zeros mb
+		if buf.Size() > 0 {
+			s.envelope.HoldOld(scheme, namespace, buf)
+		}
+	}
+	seedOld(s.defaultScheme, s.defaultNs)
+	s.registryMu.RLock()
+	for _, policy := range s.schemeRegistry {
+		if policy.Level == LevelPasswordOnly {
+			seedOld(policy.Scheme, policy.Namespace)
+		}
+	}
+	s.registryMu.RUnlock()
+
+	batchSize := s.config.BucketDEKMigrationBatchSize
+	if batchSize <= 0 {
+		batchSize = defaultMigrationBatchSize
+	}
+	interval := s.config.BucketDEKMigrationInterval
+	if interval <= 0 {
+		interval = defaultMigrationInterval
+	}
+
+	// The watcher goroutine is the sole caller of looper.Stop(). Lock() must
+	// never call looper.Stop() directly — jack's Stop() can deadlock if called
+	// concurrently or while internal workers are still running.
+	//
+	// stopCh:    closed by Lock()/Close() to signal "please stop now"
+	// stoppedCh: closed by the watcher after looper.Stop() returns, so
+	//            Lock() can wait for the looper to fully drain before proceeding
+	// doneCh:    closed by the callback when migration completes naturally
+	doneCh := make(chan struct{})
+	stopCh := make(chan struct{})
+	stoppedCh := make(chan struct{})
+	s.migrationStopCh = stopCh
+	s.migrationStoppedCh = stoppedCh
+	looper := jack.NewLooper(
+		jack.Func(func() error {
+			complete, err := s.runMigrationBatch(batchSize)
+			if err != nil {
+				s.logger.Fields("err", err).Warn("bucket DEK migration batch failed")
+				return err
+			}
+			if complete {
+				atomic.StoreInt32(&s.migrationState, int32(MigrationDone))
+				s.logger.Info("bucket DEK migration complete")
+				close(doneCh)
+			}
+			return nil
+		}),
+		jack.WithLooperInterval(interval),
+		jack.WithLooperName("keeper:dek-migration"),
+	)
+	s.migrationLooper = looper
+	looper.Start()
+	// The watcher is the only goroutine that calls looper.Stop(). It waits for
+	// either natural completion (doneCh) or an external stop signal (stopCh),
+	// calls Stop(), then closes stoppedCh so Lock() can unblock.
+	go func() {
+		select {
+		case <-doneCh:
+		case <-stopCh:
+		}
+		looper.Stop()
+		close(stoppedCh)
+	}()
+	s.logger.Info("bucket DEK migration started")
 }
 
 // startPruneScheduler creates and starts a jack.Scheduler that periodically
@@ -659,7 +899,13 @@ func (s *Keeper) startPruneScheduler() {
 			return nil
 		}
 		s.mu.RUnlock()
-		for _, policy := range s.schemeRegistry {
+		s.registryMu.RLock()
+		policies := make([]*BucketSecurityPolicy, 0, len(s.schemeRegistry))
+		for _, p := range s.schemeRegistry {
+			policies = append(policies, p)
+		}
+		s.registryMu.RUnlock()
+		for _, policy := range policies {
 			if err := s.policyChain.PruneEvents(policy.Scheme, policy.Namespace, older, keepN); err != nil {
 				s.logger.Fields("scheme", policy.Scheme, "namespace", policy.Namespace, "err", err).Warn("audit prune failed")
 			}
@@ -703,14 +949,43 @@ func (s *Keeper) startHealthPatients() {
 // signing key, and stops all background goroutines.
 func (s *Keeper) Lock() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.locked {
+		s.mu.Unlock()
 		return nil
 	}
 	if s.autoLocker != nil {
 		s.autoLocker.Stop()
 		s.autoLocker = nil
 	}
+
+	// The migration looper's callback acquires s.mu.RLock() at the start of
+	// each batch. Calling looper.Stop() while holding s.mu.Lock() would
+	// deadlock: Stop() calls wg.Wait() for the looper goroutine to exit, but
+	// that goroutine is blocked trying to RLock s.mu.
+	//
+	// Solution: signal the watcher (close stopCh), release s.mu, wait for the
+	// watcher to confirm the looper has fully stopped (stoppedCh), then
+	// re-acquire s.mu to complete the rest of Lock(). Nil-ing the fields
+	// before releasing ensures any concurrent Lock() call sees no migration to
+	// stop and cannot interfere.
+	if s.migrationStopCh != nil {
+		stopCh := s.migrationStopCh
+		stoppedCh := s.migrationStoppedCh
+		s.migrationStopCh = nil
+		s.migrationStoppedCh = nil
+		s.migrationLooper = nil
+		s.mu.Unlock()
+		close(stopCh)
+		<-stoppedCh
+		s.mu.Lock()
+	} else if s.migrationLooper != nil {
+		// No watcher (migration completed naturally before Lock() was called).
+		// The looper is already stopped; just clear the field.
+		s.migrationLooper = nil
+	}
+
+	defer s.mu.Unlock()
+
 	if s.jackReaper != nil {
 		s.jackReaper.Stop()
 		s.jackReaper = nil
@@ -729,8 +1004,13 @@ func (s *Keeper) Lock() error {
 	}
 	s.envelope.DropAll()
 	s.auditStore.setSigningKey(nil)
+	s.auditStore.setEncKey(nil)
 	zero.Bytes(s.policyKey)
 	s.policyKey = nil
+	zero.Bytes(s.policyEncKey)
+	s.policyEncKey = nil
+	zero.Bytes(s.auditEncKey)
+	s.auditEncKey = nil
 	if s.master != nil {
 		s.master.Destroy()
 		s.master = nil
@@ -793,6 +1073,21 @@ func (s *Keeper) GetNamespacedFull(scheme, namespace, key string) ([]byte, error
 		s.jackReaper.Touch(scheme + ":" + namespace)
 	}
 	s.mu.RUnlock()
+
+	if s.hooks.PreGet != nil {
+		if err := s.hooks.PreGet(scheme, namespace, key); err != nil {
+			s.metrics.IncrementReadError()
+			s.audit("get", scheme, namespace, key, false, time.Since(start))
+			return nil, err
+		}
+	}
+	if policy, _ := s.policyChain.GetPolicy(scheme, namespace); policy != nil && policy.Handler != nil {
+		if err := policy.Handler.PreGet(scheme, namespace, key); err != nil {
+			s.metrics.IncrementReadError()
+			s.audit("get", scheme, namespace, key, false, time.Since(start))
+			return nil, err
+		}
+	}
 
 	var secret Secret
 	if err := s.db.View(func(tx pkgstore.Tx) error {
@@ -1007,6 +1302,14 @@ func (s *Keeper) SetNamespacedFull(scheme, namespace, key string, value []byte) 
 	latency := time.Since(start)
 	s.metrics.RecordWriteLatency(latency)
 	s.audit("set", scheme, namespace, key, true, latency)
+
+	if s.hooks.PostSet != nil {
+		s.hooks.PostSet(scheme, namespace, key, value)
+	}
+	if policy, _ := s.policyChain.GetPolicy(scheme, namespace); policy != nil && policy.Handler != nil {
+		policy.Handler.PostSet(scheme, namespace, key, value)
+	}
+
 	return nil
 }
 
@@ -1045,7 +1348,7 @@ func (s *Keeper) DeleteNamespacedFull(scheme, namespace, key string) error {
 		}
 	}
 	if policy, _ := s.policyChain.GetPolicy(scheme, namespace); policy != nil && policy.Handler != nil {
-		if err := policy.Handler.OnDelete(scheme, namespace, key); err != nil {
+		if err := policy.Handler.PreDelete(scheme, namespace, key); err != nil {
 			s.audit("delete", scheme, namespace, key, false, time.Since(start))
 			return err
 		}
@@ -1064,6 +1367,12 @@ func (s *Keeper) DeleteNamespacedFull(scheme, namespace, key string) error {
 	if err == nil {
 		_ = s.policyChain.AppendEvent(scheme, namespace, "key_deleted",
 			map[string]string{"key": key})
+		if s.hooks.PostDelete != nil {
+			s.hooks.PostDelete(scheme, namespace, key)
+		}
+		if policy, _ := s.policyChain.GetPolicy(scheme, namespace); policy != nil && policy.Handler != nil {
+			policy.Handler.PostDelete(scheme, namespace, key)
+		}
 	}
 	s.audit("delete", scheme, namespace, key, err == nil, time.Since(start))
 	return err
@@ -1090,6 +1399,19 @@ func (s *Keeper) CompareAndSwapNamespacedFull(scheme, namespace, key string, old
 	}
 	s.updateActivity()
 	s.mu.RUnlock()
+
+	if s.hooks.PreCAS != nil {
+		if err := s.hooks.PreCAS(scheme, namespace, key, oldValue, newValue); err != nil {
+			s.audit("cas", scheme, namespace, key, false, time.Since(start))
+			return err
+		}
+	}
+	if policy, _ := s.policyChain.GetPolicy(scheme, namespace); policy != nil && policy.Handler != nil {
+		if err := policy.Handler.PreCAS(scheme, namespace, key, oldValue, newValue); err != nil {
+			s.audit("cas", scheme, namespace, key, false, time.Since(start))
+			return err
+		}
+	}
 
 	now := time.Now()
 	err := s.db.Update(func(tx pkgstore.Tx) error {
@@ -1150,6 +1472,14 @@ func (s *Keeper) CompareAndSwapNamespacedFull(scheme, namespace, key string, old
 		return b.Put([]byte(key), nd)
 	})
 	s.audit("cas", scheme, namespace, key, err == nil, time.Since(start))
+	if err == nil {
+		if s.hooks.PostCAS != nil {
+			s.hooks.PostCAS(scheme, namespace, key, newValue)
+		}
+		if policy, _ := s.policyChain.GetPolicy(scheme, namespace); policy != nil && policy.Handler != nil {
+			policy.Handler.PostCAS(scheme, namespace, key, newValue)
+		}
+	}
 	return err
 }
 
@@ -1516,6 +1846,27 @@ func (s *Keeper) SetHooks(hooks Hooks) {
 	s.hooks = hooks
 }
 
+// ExportAuditKey derives and returns a fresh copy of the audit encryption key.
+// The caller must zero the returned slice when done.
+// Returns an error when the store is locked.
+func (s *Keeper) ExportAuditKey() ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.locked {
+		return nil, ErrStoreLocked
+	}
+	masterBytes, err := s.master.Bytes()
+	if err != nil {
+		return nil, fmt.Errorf("ExportAuditKey: %w", err)
+	}
+	defer zero.Bytes(masterBytes)
+	_, auditEncKey, err := deriveMetadataKeys(masterBytes, s.config)
+	if err != nil {
+		return nil, fmt.Errorf("ExportAuditKey: %w", err)
+	}
+	return auditEncKey, nil
+}
+
 // SetDefaultScheme sets the default scheme used when none is specified.
 func (s *Keeper) SetDefaultScheme(scheme string) error {
 	if !isValidScheme(scheme) {
@@ -1547,6 +1898,24 @@ func (s *Keeper) RegisterScheme(name string, handler SchemeHandler) error {
 }
 
 // MoveCrossBucket moves a key between two buckets.
+// securityLevelRank returns the numeric security rank for a SecurityLevel.
+// Higher rank = higher security. Used for downgrade detection in
+// MoveCrossBucket and CopyCrossBucket.
+func securityLevelRank(l SecurityLevel) int {
+	switch l {
+	case LevelPasswordOnly:
+		return 1
+	case LevelAdminWrapped:
+		return 2
+	case LevelHSM:
+		return 3
+	case LevelRemote:
+		return 3
+	default:
+		return 0
+	}
+}
+
 func (s *Keeper) MoveCrossBucket(key, fromScheme, fromNS, toScheme, toNS string, confirmDowngrade bool) error {
 	fp, err := s.policyChain.GetPolicy(fromScheme, fromNS)
 	if err != nil {
@@ -1556,7 +1925,7 @@ func (s *Keeper) MoveCrossBucket(key, fromScheme, fromNS, toScheme, toNS string,
 	if err != nil {
 		return err
 	}
-	if fp.Level > tp.Level && !confirmDowngrade {
+	if securityLevelRank(fp.Level) > securityLevelRank(tp.Level) && !confirmDowngrade {
 		s.audit("security_downgrade_attempt", fromScheme, fromNS, key, false, 0)
 		return ErrSecurityDowngrade
 	}
@@ -1580,7 +1949,7 @@ func (s *Keeper) CopyCrossBucket(key, fromScheme, fromNS, toScheme, toNS string,
 	if err != nil {
 		return err
 	}
-	if fp.Level > tp.Level && !confirmDowngrade {
+	if securityLevelRank(fp.Level) > securityLevelRank(tp.Level) && !confirmDowngrade {
 		s.audit("security_downgrade_attempt", fromScheme, fromNS, key, false, 0)
 		return ErrSecurityDowngrade
 	}

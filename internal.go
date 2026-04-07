@@ -43,6 +43,161 @@ func unmarshalEncryptedMetadata(data []byte, m *EncryptedMetadata) error {
 	return msgpack.Unmarshal(data, m)
 }
 
+// marshalPolicy encodes a BucketSecurityPolicy using msgpack and encrypts it
+// with policyEncKey when the store is unlocked. When policyEncKey is nil
+// (store locked or key not yet derived), returns plain msgpack — this path
+// is only hit during CreateBucket before the first unlock, which is a setup
+// operation that runs before any encryption keys exist.
+func (s *Keeper) marshalPolicy(p *BucketSecurityPolicy) ([]byte, error) {
+	plain, err := msgpack.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	if len(s.policyEncKey) == 0 {
+		return plain, nil
+	}
+	return s.encryptMetadata(plain, s.policyEncKey)
+}
+
+// errPolicyEncrypted is returned by unmarshalPolicy when the blob is ciphertext
+// but policyEncKey is not yet available (store locked / pre-unlock load).
+// loadPolicies treats this as a skip signal, not a hard failure.
+var errPolicyEncrypted = stdErrors.New("policy is encrypted — key not available")
+
+// unmarshalPolicy decodes a BucketSecurityPolicy.
+//
+// Format v2 (the only supported format) always stores policies encrypted.
+// policyEncKey is required to read them — it is derived from the master key
+// and available only after UnlockDatabase.
+//
+// When policyEncKey is nil (pre-unlock), all blobs are unconditionally
+// skipped via errPolicyEncrypted. UnlockDatabase re-calls loadPolicies once
+// the key is available. There is no plaintext fallback: keeper is pre-release
+// and format v2 is the only on-disk format.
+func (s *Keeper) unmarshalPolicy(data []byte, p *BucketSecurityPolicy) error {
+	if len(data) == 0 {
+		return fmt.Errorf("unmarshalPolicy: empty data")
+	}
+	if len(s.policyEncKey) == 0 {
+		// No key yet — all policies are encrypted, nothing is readable.
+		// UnlockDatabase will reload with the key.
+		return errPolicyEncrypted
+	}
+	dec, err := s.decryptMetadata(data, s.policyEncKey)
+	if err != nil {
+		return fmt.Errorf("policy decryption failed: %w", err)
+	}
+	return msgpack.Unmarshal(dec, p)
+}
+
+// marshalWAL encodes a RotationWAL using msgpack and encrypts it.
+func (s *Keeper) marshalWAL(w *RotationWAL) ([]byte, error) {
+	plain, err := msgpack.Marshal(w)
+	if err != nil {
+		return nil, err
+	}
+	if len(s.policyEncKey) == 0 {
+		return plain, nil
+	}
+	return s.encryptMetadata(plain, s.policyEncKey)
+}
+
+// unmarshalWAL decodes a RotationWAL, decrypting if policyEncKey is set.
+func (s *Keeper) unmarshalWAL(data []byte, w *RotationWAL) error {
+	payload := data
+	if len(s.policyEncKey) > 0 {
+		if dec, err := s.decryptMetadata(data, s.policyEncKey); err == nil {
+			payload = dec
+		}
+	}
+	if len(payload) > 0 && payload[0] == '{' {
+		return json.Unmarshal(payload, w)
+	}
+	return msgpack.Unmarshal(payload, w)
+}
+
+// marshalSaltStore encodes a SaltStore using msgpack.
+// The KDF salt is intentionally stored unencrypted: it must be readable before
+// UnlockDatabase (to derive the master key), so encrypting it with policyEncKey
+// — which is only available after unlock — would create a circular dependency.
+// A KDF salt is not a secret; its purpose is uniqueness, not confidentiality.
+func (s *Keeper) marshalSaltStore(st *SaltStore) ([]byte, error) {
+	return msgpack.Marshal(st)
+}
+
+// unmarshalSaltStore decodes a SaltStore from msgpack or legacy JSON.
+func (s *Keeper) unmarshalSaltStore(data []byte, st *SaltStore) error {
+	if len(data) > 0 && data[0] == '{' {
+		return json.Unmarshal(data, st)
+	}
+	return msgpack.Unmarshal(data, st)
+}
+
+// Metadata encryption key derivation
+
+// deriveMetadataKeys derives policyEncKey and auditEncKey from masterKey using
+// HKDF-SHA256. Key length is determined from the configured cipher's KeySize()
+// method, defaulting to masterKeyLen (32) when NewCipher is nil.
+func deriveMetadataKeys(masterKey []byte, cfg Config) (policyEncKey, auditEncKey []byte, err error) {
+	keyLen := masterKeyLen
+	if cfg.NewCipher != nil {
+		if probe, perr := cfg.NewCipher(make([]byte, masterKeyLen)); perr == nil {
+			keyLen = probe.KeySize()
+		}
+	}
+	expand := func(info string) ([]byte, error) {
+		r := hkdf.New(sha256.New, masterKey, nil, []byte(info))
+		k := make([]byte, keyLen)
+		if _, err := io.ReadFull(r, k); err != nil {
+			return nil, fmt.Errorf("%s: HKDF expansion failed: %w", info, err)
+		}
+		return k, nil
+	}
+	policyEncKey, err = expand(hkdfInfoPolicyEnc)
+	if err != nil {
+		return nil, nil, err
+	}
+	auditEncKey, err = expand(hkdfInfoAuditEnc)
+	if err != nil {
+		zero.Bytes(policyEncKey)
+		return nil, nil, err
+	}
+	return policyEncKey, auditEncKey, nil
+}
+
+// Policy bucket key helpers
+
+// policyBaseKey returns the opaque on-disk key for a scheme:namespace pair.
+// SHA-256("scheme:namespace")[:16] encoded as 32 hex chars = 128-bit key space.
+func policyBaseKey(scheme, namespace string) string {
+	h := sha256.Sum256([]byte(scheme + ":" + namespace))
+	return hex.EncodeToString(h[:16])
+}
+
+func policyHashKey(base string) string { return base + policyHashSuffix }
+func policyHMACKey(base string) string { return base + policyHMACSuffix }
+
+// Generic metadata encrypt / decrypt
+
+// encryptMetadata encrypts plaintext using the keeper's configured cipher.
+// Wire format: nonce(cipher.NonceSize()) || AEAD-ciphertext.
+func (s *Keeper) encryptMetadata(plaintext, key []byte) ([]byte, error) {
+	c, err := s.config.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("encryptMetadata: cipher init: %w", err)
+	}
+	return c.Encrypt(plaintext)
+}
+
+// decryptMetadata decrypts a blob produced by encryptMetadata.
+func (s *Keeper) decryptMetadata(blob, key []byte) ([]byte, error) {
+	c, err := s.config.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("decryptMetadata: cipher init: %w", err)
+	}
+	return c.Decrypt(blob)
+}
+
 func (s *Keeper) initBuckets() error {
 	return s.db.Update(func(tx pkgstore.Tx) error {
 		for _, name := range []string{metaBucket, policyBucket, auditBucketRoot} {
@@ -108,7 +263,28 @@ func (s *Keeper) isBucketUnlocked(scheme, namespace string) bool {
 	return policy.Level == LevelPasswordOnly
 }
 
-// unlockBucketPasswordOnly places the master key (as DEK) into the Envelope.
+// deriveBucketDEK derives a per-bucket 32-byte DEK from the master key using
+// HKDF-SHA256, domain-separated by scheme and namespace.
+//
+//	bucketDEK = HKDF-SHA256(ikm=masterKey, salt=nil, info="keeper-bucket-dek-v1:<scheme>:<namespace>")
+//
+// Each LevelPasswordOnly bucket gets an independent key. Leaking one bucket's
+// DEK does not expose the master key or any other bucket's secrets.
+// The info string is fixed — changing it is a breaking on-disk format change.
+func deriveBucketDEK(masterKey []byte, scheme, namespace string) ([]byte, error) {
+	info := hkdfInfoBucketDEK + ":" + scheme + ":" + namespace
+	r := hkdf.New(sha256.New, masterKey, nil, []byte(info))
+	key := make([]byte, masterKeyLen)
+	if _, err := io.ReadFull(r, key); err != nil {
+		return nil, fmt.Errorf("deriveBucketDEK: HKDF failed for %s:%s: %w", scheme, namespace, err)
+	}
+	return key, nil
+}
+
+// unlockBucketPasswordOnly derives the per-bucket DEK and places it into the
+// Envelope. When a migration is in progress both the new derived key and the
+// old master-key-as-DEK are seeded so records can be decrypted regardless of
+// which epoch they were written in.
 func (s *Keeper) unlockBucketPasswordOnly(scheme, namespace string) error {
 	if s.master == nil {
 		return ErrStoreLocked
@@ -117,11 +293,32 @@ func (s *Keeper) unlockBucketPasswordOnly(scheme, namespace string) error {
 	if err != nil {
 		return err
 	}
-	buf := memguard.NewBufferFromBytes(masterBytes)
+	defer zero.Bytes(masterBytes)
+
+	newDEK, err := deriveBucketDEK(masterBytes, scheme, namespace)
+	if err != nil {
+		return err
+	}
+
+	buf := memguard.NewBufferFromBytes(newDEK)
+	zero.Bytes(newDEK)
 	if buf.Size() == 0 {
-		return fmt.Errorf("failed to allocate buffer for master key")
+		return fmt.Errorf("failed to allocate buffer for bucket DEK")
 	}
 	s.envelope.Hold(scheme, namespace, buf)
+
+	// During migration the old key (master key used directly as DEK) must also
+	// be available so unmigrated records can be decrypted. The fallback decrypt
+	// path tries the new derived key first, then falls back to the old key.
+	// XChaCha20-Poly1305 Open processes the full ciphertext before returning an
+	// error, so both attempts take the same time — no timing side-channel.
+	if atomic.LoadInt32(&s.migrationState) == int32(MigrationInProgress) {
+		oldBuf := memguard.NewBufferFromBytes(masterBytes)
+		if oldBuf.Size() > 0 {
+			s.envelope.HoldOld(scheme, namespace, oldBuf)
+		}
+	}
+
 	s.logger.Fields("scheme", scheme, "namespace", namespace).Debug("bucket seeded (password-only)")
 	return nil
 }
@@ -232,7 +429,29 @@ func (s *Keeper) decrypt(ciphertext []byte, scheme, namespace string) ([]byte, e
 		return nil, err
 	}
 	defer zero.Bytes(key)
-	return s.decryptWithKey(ciphertext, key)
+
+	pt, err := s.decryptWithKey(ciphertext, key)
+	if err == nil {
+		return pt, nil
+	}
+
+	// Fallback: if the new derived key fails and a pre-migration old key is
+	// available, try decrypting with it. This handles records written before
+	// the per-bucket DEK derivation migration completed.
+	//
+	// XChaCha20-Poly1305 Open processes the full ciphertext before returning
+	// an authentication error, so both attempts take the same time — no
+	// timing side-channel leaks which key succeeded.
+	oldBuf, oldErr := s.envelope.RetrieveOld(scheme, namespace)
+	if oldErr != nil {
+		return nil, err // original error — no fallback key available
+	}
+	oldKey := make([]byte, oldBuf.Size())
+	copy(oldKey, oldBuf.Bytes())
+	oldBuf.Destroy()
+	defer zero.Bytes(oldKey)
+
+	return s.decryptWithKey(ciphertext, oldKey)
 }
 
 func (s *Keeper) encryptWithKey(plaintext, key []byte) ([]byte, error) {
@@ -296,6 +515,14 @@ func (s *Keeper) reencryptAllWithKey(newKey, oldKey []byte) error {
 // resumeRotation continues an interrupted rotation automatically.
 // Called from UnlockDatabase when a WAL is present.
 // masterKey is the new master key (already verified by UnlockDatabase).
+//
+// In addition to completing any unfinished secret re-encryption, this
+// function re-encrypts all policy blobs from the old policyEncKey to the
+// current s.policyEncKey. This is necessary because a crash between
+// Rotate()'s reencryptAllWithKey and reencryptAllPolicies steps would
+// leave policy blobs encrypted under the old key. s.policyEncKey is already
+// set to the new-master-derived value by UnlockDatabase before we are called,
+// so we derive the old policyEncKey from oldKey to decrypt the stale blobs.
 func (s *Keeper) resumeRotation(masterKey []byte) error {
 	wal, err := s.readRotationWAL()
 	if err != nil {
@@ -319,7 +546,25 @@ func (s *Keeper) resumeRotation(masterKey []byte) error {
 	if err := s.encryptAllRecords(masterKey, oldKey, wal); err != nil {
 		return fmt.Errorf("re-encryption resume failed: %w", err)
 	}
-	return s.clearRotationWAL()
+	if err := s.clearRotationWAL(); err != nil {
+		return err
+	}
+
+	// Re-encrypt any policy blobs that were not yet migrated to the new key.
+	// Derive the old policyEncKey from the unwrapped old master key so we can
+	// decrypt blobs that may still be encrypted under it.
+	oldPolicyEncKey, _, err := deriveMetadataKeys(oldKey, s.config)
+	if err != nil {
+		return fmt.Errorf("resumeRotation: derive old policy enc key: %w", err)
+	}
+	defer zero.Bytes(oldPolicyEncKey)
+	if err := s.reencryptAllPolicies(oldPolicyEncKey); err != nil {
+		return fmt.Errorf("resumeRotation: policy re-encryption: %w", err)
+	}
+	if err := s.upgradePolicyHMACs(); err != nil {
+		s.logger.Fields("err", err).Warn("resumeRotation: policy HMAC upgrade failed — continuing")
+	}
+	return nil
 }
 
 // isHSMOrRemotePolicy returns true when the registered policy for the given
@@ -327,7 +572,10 @@ func (s *Keeper) resumeRotation(masterKey []byte) error {
 // master-key re-encryption. Unregistered keys default to false.
 func (s *Keeper) isHSMOrRemotePolicy(scheme, namespace string) bool {
 	key := scheme + ":" + namespace
-	if p, ok := s.schemeRegistry[key]; ok {
+	s.registryMu.RLock()
+	p, ok := s.schemeRegistry[key]
+	s.registryMu.RUnlock()
+	if ok {
 		return p.Level == LevelHSM || p.Level == LevelRemote
 	}
 	return false
@@ -374,6 +622,24 @@ func (s *Keeper) encryptAllRecords(newKey, oldKey []byte, wal *RotationWAL) erro
 				continue
 			}
 
+			// Derive the effective per-bucket DEKs for this namespace.
+			// Records may be in either epoch:
+			//   • pre-migration:  encrypted under the raw master key
+			//   • post-migration: encrypted under deriveBucketDEK(masterKey, scheme, ns)
+			// effectiveOld is tried first; rawOld is the fallback.
+			// effectiveNew is always the derived DEK from the new master so that
+			// unlockBucketPasswordOnly will find the right key after rotation.
+			effectiveOld, errOld := deriveBucketDEK(oldKey, schemeName, nsName)
+			if errOld != nil {
+				return fmt.Errorf("derive old bucket DEK for %s:%s: %w", schemeName, nsName, errOld)
+			}
+			defer zero.Bytes(effectiveOld)
+			effectiveNew, errNew := deriveBucketDEK(newKey, schemeName, nsName)
+			if errNew != nil {
+				return fmt.Errorf("derive new bucket DEK for %s:%s: %w", schemeName, nsName, errNew)
+			}
+			defer zero.Bytes(effectiveNew)
+
 			var keys []string
 			if err := s.db.View(func(tx pkgstore.Tx) error {
 				nb := s.getNamespaceBucket(tx, schemeName, nsName)
@@ -395,7 +661,7 @@ func (s *Keeper) encryptAllRecords(newKey, oldKey []byte, wal *RotationWAL) erro
 				if wal.LastKey != "" && cursor <= wal.LastKey {
 					continue // already completed before crash
 				}
-				if err := s.reencryptRecord(schemeName, nsName, key, newKey, oldKey); err != nil {
+				if err := s.reencryptRecord(schemeName, nsName, key, effectiveNew, effectiveOld, oldKey); err != nil {
 					return err
 				}
 				wal.LastKey = cursor
@@ -408,8 +674,23 @@ func (s *Keeper) encryptAllRecords(newKey, oldKey []byte, wal *RotationWAL) erro
 	return nil
 }
 
-// reencryptRecord re-encrypts a single secret in one atomic bbolt.Update.
-func (s *Keeper) reencryptRecord(scheme, namespace, key string, newKey, oldKey []byte) error {
+// reencryptRecord re-encrypts a single secret in one atomic bbolt.Update
+// during a master key rotation. For LevelPasswordOnly buckets the on-disk
+// records may be encrypted under either the raw master key (pre-migration) or
+// the per-bucket derived DEK (post-migration). This function accepts the two
+// effective old keys in priority order: effectiveOld is tried first (the
+// derived bucket DEK from the old master), then rawOld (the raw master key) as
+// a fallback for records that have not yet been through DEK migration. The
+// output is always written under effectiveNew (the derived bucket DEK from the
+// new master), which matches what unlockBucketPasswordOnly will derive after
+// the rotation completes.
+//
+// For non-LevelPasswordOnly buckets (LevelHSM, LevelRemote) this function is
+// never called — they are skipped in encryptAllRecords. For callers that
+// process buckets where both old keys are identical (e.g. the raw master key
+// equals the derived key, which cannot happen in practice) the fallback is a
+// no-op.
+func (s *Keeper) reencryptRecord(scheme, namespace, key string, effectiveNew, effectiveOld, rawOld []byte) error {
 	return s.db.Update(func(tx pkgstore.Tx) error {
 		nb := s.getNamespaceBucket(tx, scheme, namespace)
 		if nb == nil {
@@ -423,11 +704,20 @@ func (s *Keeper) reencryptRecord(scheme, namespace, key string, newKey, oldKey [
 		if err := unmarshalSecret(v, &secret); err != nil {
 			return fmt.Errorf("unmarshal %s: %w", key, err)
 		}
-		pt, err := s.decryptWithKey(secret.Ciphertext, oldKey)
-		if err != nil {
-			return fmt.Errorf("decrypt %s: %w", key, err)
+
+		// Try the derived old DEK first (already-migrated record), then the
+		// raw master key (not-yet-migrated record). Track which key succeeded
+		// so we use the correct meta key for decrypting EncryptedMeta below.
+		pt, err := s.decryptWithKey(secret.Ciphertext, effectiveOld)
+		decryptedWithDerived := err == nil
+		if !decryptedWithDerived {
+			pt, err = s.decryptWithKey(secret.Ciphertext, rawOld)
+			if err != nil {
+				return fmt.Errorf("decrypt %s: %w", key, err)
+			}
 		}
-		ct, err := s.encryptWithKey(pt, newKey)
+
+		ct, err := s.encryptWithKey(pt, effectiveNew)
 		zero.Bytes(pt)
 		if err != nil {
 			return fmt.Errorf("encrypt %s: %w", key, err)
@@ -435,7 +725,13 @@ func (s *Keeper) reencryptRecord(scheme, namespace, key string, newKey, oldKey [
 		secret.Ciphertext = ct
 
 		if len(secret.EncryptedMeta) > 0 {
-			oldMetaKey, merr := s.deriveMetaKey(oldKey)
+			// The meta key is derived from whichever DEK was used to encrypt
+			// the record. Use the matching key so decryption succeeds.
+			oldDecryptKey := rawOld
+			if decryptedWithDerived {
+				oldDecryptKey = effectiveOld
+			}
+			oldMetaKey, merr := s.deriveMetaKey(oldDecryptKey)
 			if merr != nil {
 				return fmt.Errorf("derive old meta key: %w", merr)
 			}
@@ -444,7 +740,7 @@ func (s *Keeper) reencryptRecord(scheme, namespace, key string, newKey, oldKey [
 			if merr != nil {
 				return fmt.Errorf("decrypt meta %s: %w", key, merr)
 			}
-			newMetaKey, merr := s.deriveMetaKey(newKey)
+			newMetaKey, merr := s.deriveMetaKey(effectiveNew)
 			if merr != nil {
 				return fmt.Errorf("derive new meta key: %w", merr)
 			}
@@ -465,7 +761,7 @@ func (s *Keeper) reencryptRecord(scheme, namespace, key string, newKey, oldKey [
 }
 
 func (s *Keeper) writeRotationWAL(wal *RotationWAL) error {
-	data, err := json.Marshal(wal)
+	data, err := s.marshalWAL(wal)
 	if err != nil {
 		return err
 	}
@@ -489,7 +785,7 @@ func (s *Keeper) readRotationWAL() (*RotationWAL, error) {
 		if data == nil {
 			return stdErrors.New("rotation WAL not found")
 		}
-		return json.Unmarshal(data, &wal)
+		return s.unmarshalWAL(data, &wal)
 	})
 	return &wal, err
 }
@@ -618,10 +914,17 @@ func (s *Keeper) loadSaltStore() (*SaltStore, error) {
 	if raw == nil {
 		return nil, nil
 	}
-	// Detect legacy format: a bare 32-byte salt stored as raw bytes.
-	// A JSON SaltStore always starts with '{'.
-	if len(raw) > 0 && raw[0] != '{' {
-		// Migrate: wrap the bare salt in a versioned store.
+	// Three possible formats:
+	// Legacy bare salt: exactly masterKeyLen random bytes (pre-versioned format).
+	//      A versioned SaltStore — even the smallest possible — is always larger
+	//      than masterKeyLen bytes, so length is the reliable discriminator.
+	// JSON SaltStore (written before the msgpack migration): starts with '{'.
+	// Msgpack SaltStore (current format): starts with a msgpack map header.
+	//
+	// We check length first so that random salt bytes that happen to start with
+	// '{' or a msgpack header byte are never misidentified as structured records.
+	if len(raw) == masterKeyLen {
+		// Legacy bare salt — wrap it in a versioned store and rewrite.
 		salt := append([]byte(nil), raw...)
 		store := &SaltStore{
 			CurrentVersion: 1,
@@ -635,14 +938,14 @@ func (s *Keeper) loadSaltStore() (*SaltStore, error) {
 		return store, nil
 	}
 	var store SaltStore
-	if err := json.Unmarshal(raw, &store); err != nil {
+	if err := s.unmarshalSaltStore(raw, &store); err != nil {
 		return nil, fmt.Errorf("failed to decode salt store: %w", err)
 	}
 	return &store, nil
 }
 
 func (s *Keeper) saveSaltStore(store *SaltStore) error {
-	data, err := json.Marshal(store)
+	data, err := s.marshalSaltStore(store)
 	if err != nil {
 		return err
 	}
@@ -746,26 +1049,28 @@ func policyHashIntegrity(data []byte) string {
 // savePolicy persists a policy with both a SHA-256 hash and, when the store
 // is unlocked (policyKey set), an authenticated HMAC tag. All three entries
 // are written in one atomic bbolt.Update — no partial state is possible.
+// The on-disk key is policyBaseKey(scheme, namespace) — an opaque 32-hex-char
+// hash that hides the bucket structure from offline readers.
 func (s *Keeper) savePolicy(policy *BucketSecurityPolicy) error {
 	return s.db.Update(func(tx pkgstore.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(policyBucket))
 		if err != nil {
 			return err
 		}
-		key := fmt.Sprintf("%s:%s", policy.Scheme, policy.Namespace)
-		data, err := json.Marshal(policy)
+		base := policyBaseKey(policy.Scheme, policy.Namespace)
+		data, err := s.marshalPolicy(policy)
 		if err != nil {
 			return err
 		}
-		if err := bucket.Put([]byte(key), data); err != nil {
+		if err := bucket.Put([]byte(base), data); err != nil {
 			return err
 		}
-		if err := bucket.Put([]byte(key+policyHashSuffix), []byte(policyHashIntegrity(data))); err != nil {
+		if err := bucket.Put([]byte(policyHashKey(base)), []byte(policyHashIntegrity(data))); err != nil {
 			return err
 		}
 		if len(s.policyKey) > 0 {
 			tag := computePolicyHMAC(s.policyKey, data)
-			if err := bucket.Put([]byte(key+policyHMACSuffix), []byte(tag)); err != nil {
+			if err := bucket.Put([]byte(policyHMACKey(base)), []byte(tag)); err != nil {
 				return err
 			}
 		}
@@ -774,7 +1079,10 @@ func (s *Keeper) savePolicy(policy *BucketSecurityPolicy) error {
 }
 
 // loadPolicies populates schemeRegistry at startup before unlock.
-// Only the SHA-256 hash is verified at this stage.
+// Iterates all keys in the policy bucket, skips hash/HMAC suffix keys,
+// decrypts and decodes each policy value.
+// When called before UnlockDatabase (policyEncKey nil), encrypted entries are
+// silently skipped — UnlockDatabase re-calls loadPolicies once the key is set.
 func (s *Keeper) loadPolicies() error {
 	return s.db.View(func(tx pkgstore.Tx) error {
 		policies := tx.Bucket([]byte(policyBucket))
@@ -787,10 +1095,18 @@ func (s *Keeper) loadPolicies() error {
 				return nil
 			}
 			var policy BucketSecurityPolicy
-			if err := json.Unmarshal(v, &policy); err != nil {
+			if err := s.unmarshalPolicy(v, &policy); err != nil {
+				if stdErrors.Is(err, errPolicyEncrypted) {
+					// Key not available yet — skip; UnlockDatabase will reload.
+					return nil
+				}
 				return err
 			}
-			s.schemeRegistry[key] = &policy
+			// Registry key is always "scheme:namespace" in memory.
+			registryKey := fmt.Sprintf("%s:%s", policy.Scheme, policy.Namespace)
+			s.registryMu.Lock()
+			s.schemeRegistry[registryKey] = &policy
+			s.registryMu.Unlock()
 			return nil
 		})
 	})
@@ -799,58 +1115,60 @@ func (s *Keeper) loadPolicies() error {
 // loadPolicy returns the policy for scheme/namespace, verifying the HMAC when
 // the store is unlocked. Falls back to SHA-256 when no HMAC tag exists yet.
 func (s *Keeper) loadPolicy(scheme, namespace string) (*BucketSecurityPolicy, error) {
-	key := fmt.Sprintf("%s:%s", scheme, namespace)
-	if p, ok := s.schemeRegistry[key]; ok {
+	registryKey := fmt.Sprintf("%s:%s", scheme, namespace)
+	s.registryMu.RLock()
+	p, ok := s.schemeRegistry[registryKey]
+	s.registryMu.RUnlock()
+	if ok {
 		return p, nil
 	}
+	base := policyBaseKey(scheme, namespace)
 	var policy BucketSecurityPolicy
 	err := s.db.View(func(tx pkgstore.Tx) error {
 		policies := tx.Bucket([]byte(policyBucket))
 		if policies == nil {
 			return ErrPolicyNotFound
 		}
-		data := policies.Get([]byte(key))
+		data := policies.Get([]byte(base))
 		if data == nil {
 			return ErrPolicyNotFound
 		}
 
 		if len(s.policyKey) > 0 {
-			if tag := policies.Get([]byte(key + policyHMACSuffix)); tag != nil {
+			if tag := policies.Get([]byte(policyHMACKey(base))); tag != nil {
 				expected := computePolicyHMAC(s.policyKey, data)
 				if !hmac.Equal([]byte(expected), tag) {
-					return fmt.Errorf("%w: HMAC mismatch for policy %s", ErrPolicySignature, key)
+					return fmt.Errorf("%w: HMAC mismatch for policy %s:%s", ErrPolicySignature, scheme, namespace)
 				}
 			} else {
-				// No HMAC yet — fall back to SHA-256.
-				if storedHash := policies.Get([]byte(key + policyHashSuffix)); storedHash != nil {
+				if storedHash := policies.Get([]byte(policyHashKey(base))); storedHash != nil {
 					if policyHashIntegrity(data) != string(storedHash) {
-						return fmt.Errorf("policy integrity check failed for %s", key)
+						return fmt.Errorf("policy integrity check failed for %s:%s", scheme, namespace)
 					}
 				}
 			}
 		} else {
-			if storedHash := policies.Get([]byte(key + policyHashSuffix)); storedHash != nil {
+			if storedHash := policies.Get([]byte(policyHashKey(base))); storedHash != nil {
 				if policyHashIntegrity(data) != string(storedHash) {
-					return fmt.Errorf("policy integrity check failed for %s", key)
+					return fmt.Errorf("policy integrity check failed for %s:%s", scheme, namespace)
 				}
 			}
 		}
 
-		return json.Unmarshal(data, &policy)
+		return s.unmarshalPolicy(data, &policy)
 	})
 	if err != nil {
 		return nil, err
 	}
-	s.schemeRegistry[key] = &policy
+	s.registryMu.Lock()
+	s.schemeRegistry[registryKey] = &policy
+	s.registryMu.Unlock()
 	return &policy, nil
 }
 
-// upgradePolicyHMACs writes HMAC tags for any policy that has only a SHA-256
-// hash. Called from UnlockDatabase and Rotate after the policyKey is set.
-// Each policy's HMAC is written in the same transaction as its existing data,
-// so no partial state is possible within a single policy upgrade.
-// If the process crashes mid-upgrade, the next UnlockDatabase will re-run this
-// function and complete the remaining policies.
+// upgradePolicyHMACs writes HMAC tags for any policy that only has a SHA-256
+// hash. Called from UnlockDatabase and Rotate after policyKey is set.
+// Uses hashed keys — compatible with the new savePolicy layout.
 func (s *Keeper) upgradePolicyHMACs() error {
 	if len(s.policyKey) == 0 {
 		return nil
@@ -865,11 +1183,12 @@ func (s *Keeper) upgradePolicyHMACs() error {
 			if isPolicyHashKey(key) {
 				return nil
 			}
-			if policies.Get([]byte(key+policyHMACSuffix)) != nil {
+			hmacKey := key + policyHMACSuffix
+			if policies.Get([]byte(hmacKey)) != nil {
 				return nil // already has HMAC tag
 			}
 			tag := computePolicyHMAC(s.policyKey, v)
-			return policies.Put([]byte(key+policyHMACSuffix), []byte(tag))
+			return policies.Put([]byte(hmacKey), []byte(tag))
 		})
 	})
 }
@@ -881,11 +1200,163 @@ func (s *Keeper) appendAuditEvent(event *BucketEvent) error {
 	if s.config.Jack.Pool != nil && event.EventType != "created" {
 		ev := event
 		s.config.Jack.Pool.Do(func() {
-			_ = s.auditStore.appendEvent(ev.Scheme, ev.Namespace, ev)
+			if err := s.auditStore.appendEvent(ev.Scheme, ev.Namespace, ev); err != nil {
+				s.logger.Fields(
+					"scheme", ev.Scheme,
+					"namespace", ev.Namespace,
+					"event_type", ev.EventType,
+					"err", err,
+				).Error("async audit event failed")
+			}
 		})
 		return nil
 	}
 	return s.auditStore.appendEvent(event.Scheme, event.Namespace, event)
+}
+
+// reencryptAllPolicies re-encrypts every on-disk policy from oldEncKey to
+// the current s.policyEncKey. Call this immediately after swapping policyEncKey
+// during Rotate/RotateSalt so the next Unlock can decrypt with the new key.
+// Also called by resumeRotation to handle policies that were not yet migrated
+// when a process died mid-rotation.
+//
+// All work is done atomically: a single View reads and re-encrypts every blob
+// in memory, then a single Update writes all of them together. Either every
+// policy is migrated or none are — there is no WAL to resume a partial policy
+// re-encryption, so partial writes are treated as fatal errors.
+func (s *Keeper) reencryptAllPolicies(oldEncKey []byte) error {
+	type rewrite struct {
+		base    string
+		newData []byte
+	}
+	var rewrites []rewrite
+
+	// Phase 1: read every policy blob under the old key and re-encrypt it
+	// under the already-swapped s.policyEncKey (the new key). All work is
+	// done inside a single View so the snapshot is consistent.
+	if err := s.db.View(func(tx pkgstore.Tx) error {
+		b := tx.Bucket([]byte(policyBucket))
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
+			key := string(k)
+			if isPolicyHashKey(key) {
+				return nil
+			}
+			if v == nil {
+				// Nested bucket — should never appear in policyBucket, skip.
+				return nil
+			}
+			// Decrypt with the OLD key explicitly — s.policyEncKey is the new key.
+			plain, err := s.decryptMetadata(append([]byte(nil), v...), oldEncKey)
+			if err != nil {
+				return fmt.Errorf("reencryptAllPolicies: decrypt %q: %w", key, err)
+			}
+			var p BucketSecurityPolicy
+			if err := msgpack.Unmarshal(plain, &p); err != nil {
+				return fmt.Errorf("reencryptAllPolicies: unmarshal %q: %w", key, err)
+			}
+			// marshalPolicy encrypts with s.policyEncKey (the new key).
+			newData, err := s.marshalPolicy(&p)
+			if err != nil {
+				return fmt.Errorf("reencryptAllPolicies: re-encrypt %q: %w", key, err)
+			}
+			rewrites = append(rewrites, rewrite{key, newData})
+			return nil
+		})
+	}); err != nil {
+		return err
+	}
+
+	if len(rewrites) == 0 {
+		return nil
+	}
+
+	// Phase 2: write all re-encrypted blobs in a single atomic transaction.
+	// Either every policy is updated together or none are — there is no WAL
+	// to resume a partial policy re-encryption, so partial writes are fatal.
+	return s.db.Update(func(tx pkgstore.Tx) error {
+		b := tx.Bucket([]byte(policyBucket))
+		if b == nil {
+			return stdErrors.New("reencryptAllPolicies: policy bucket missing")
+		}
+		for _, rw := range rewrites {
+			if err := b.Put([]byte(rw.base), rw.newData); err != nil {
+				return fmt.Errorf("reencryptAllPolicies: write %q: %w", rw.base, err)
+			}
+			if err := b.Put([]byte(policyHashKey(rw.base)),
+				[]byte(policyHashIntegrity(rw.newData))); err != nil {
+				return fmt.Errorf("reencryptAllPolicies: write hash %q: %w", rw.base, err)
+			}
+			// Drop the stale HMAC tag — upgradePolicyHMACs (called after this
+			// function) recomputes it with the new policyKey.
+			_ = b.Delete([]byte(policyHMACKey(rw.base)))
+		}
+		return nil
+	})
+}
+
+// seedAllBucketsFromDisk reads every policy directly from the _policies_ bbolt
+// bucket and seeds or unlocks each bucket based on its security level.
+//
+// This is the authoritative seeding path used during UnlockDatabase. It does
+// NOT rely on schemeRegistry being populated first — it reads the encrypted
+// policy blobs from disk, decrypts them with the now-available policyEncKey,
+// and acts on each one. schemeRegistry is updated as a side-effect so that
+// subsequent lookups via loadPolicy benefit from the cache.
+//
+// LevelPasswordOnly: DEK derived and seeded into Envelope immediately.
+// LevelHSM / LevelRemote: unlocked via the registered HSMProvider if present.
+// LevelAdminWrapped: skipped — requires explicit UnlockBucket call per admin.
+func (s *Keeper) seedAllBucketsFromDisk() error {
+	var policies []*BucketSecurityPolicy
+
+	if err := s.db.View(func(tx pkgstore.Tx) error {
+		b := tx.Bucket([]byte(policyBucket))
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
+			if isPolicyHashKey(string(k)) {
+				return nil
+			}
+			var p BucketSecurityPolicy
+			if err := s.unmarshalPolicy(v, &p); err != nil {
+				s.logger.Fields("key", string(k), "err", err).Warn("seedAllBucketsFromDisk: skipping unreadable policy")
+				return nil // skip — do not abort; other buckets may be healthy
+			}
+			policies = append(policies, &p)
+			return nil
+		})
+	}); err != nil {
+		return fmt.Errorf("seedAllBucketsFromDisk: db read failed: %w", err)
+	}
+
+	for _, p := range policies {
+		// Update schemeRegistry so loadPolicy cache is warm.
+		registryKey := fmt.Sprintf("%s:%s", p.Scheme, p.Namespace)
+		s.registryMu.Lock()
+		s.schemeRegistry[registryKey] = p
+		s.registryMu.Unlock()
+
+		switch p.Level {
+		case LevelPasswordOnly:
+			if err := s.unlockBucketPasswordOnly(p.Scheme, p.Namespace); err != nil {
+				s.logger.Fields("scheme", p.Scheme, "namespace", p.Namespace, "err", err).Warn("seedAllBucketsFromDisk: failed to seed PasswordOnly bucket")
+				s.audit("unlock_bucket_failed", p.Scheme, p.Namespace, "", false, 0)
+			}
+		case LevelHSM, LevelRemote:
+			if p.HSMProvider != nil {
+				if err := s.unlockBucketHSM(p.Scheme, p.Namespace); err != nil {
+					s.logger.Fields("scheme", p.Scheme, "namespace", p.Namespace, "err", err).Warn("seedAllBucketsFromDisk: HSM bucket unlock failed")
+					s.audit("unlock_hsm_bucket_failed", p.Scheme, p.Namespace, "", false, 0)
+				}
+			}
+			// LevelAdminWrapped: intentionally skipped — requires per-admin credential.
+		}
+	}
+	return nil
 }
 
 func (s *Keeper) loadAuditChain(scheme, namespace string) ([]*BucketEvent, error) {
@@ -1052,4 +1523,243 @@ func (s *Keeper) decryptMetaWithKey(data, metaKey []byte) (*EncryptedMetadata, e
 		return nil, fmt.Errorf("%w: %v", ErrMetadataDecrypt, err)
 	}
 	return &meta, nil
+}
+
+// Per-bucket DEK derivation migration
+
+// runMigrationBatch re-encrypts up to batchSize records across all
+// LevelPasswordOnly buckets using the new per-bucket derived DEK.
+//
+// Crash safety: a per-bucket WAL cursor is written to the metadata bucket
+// before each record is migrated. On restart the cursor lets the looper skip
+// already-migrated records without re-doing work.
+//
+// Returns (true, nil) when every bucket is fully migrated and the completion
+// marker has been written.
+func (s *Keeper) runMigrationBatch(batchSize int) (complete bool, err error) {
+	// Snapshot the registry under RLock so we don't race with CreateBucket /
+	// loadPolicy which write s.schemeRegistry while holding s.mu.Lock/RLock.
+	// Release the lock immediately after the snapshot — migrateBucket does
+	// long-running bbolt operations that must not hold s.mu.
+	type bucketRef = migrationBucket
+	var buckets []bucketRef
+	func() {
+		s.registryMu.RLock()
+		defer s.registryMu.RUnlock()
+		buckets = append(buckets, bucketRef{s.defaultScheme, s.defaultNs})
+		for _, policy := range s.schemeRegistry {
+			if policy.Level == LevelPasswordOnly {
+				key := policy.Scheme + ":" + policy.Namespace
+				defaultKey := s.defaultScheme + ":" + s.defaultNs
+				if key != defaultKey {
+					buckets = append(buckets, bucketRef{policy.Scheme, policy.Namespace})
+				}
+			}
+		}
+	}()
+
+	remaining := batchSize
+	for _, b := range buckets {
+		if remaining <= 0 {
+			return false, nil
+		}
+		n, done, berr := s.migrateBucket(b.scheme, b.namespace, remaining)
+		if berr != nil {
+			return false, berr
+		}
+		remaining -= n
+		if !done {
+			return false, nil // still work to do in this bucket
+		}
+		// Bucket fully migrated — drop the old fallback key from memory.
+		s.envelope.DropOld(b.scheme, b.namespace)
+	}
+
+	// All buckets complete — write the marker and clean up WAL cursors atomically.
+	if err := s.writeMigrationDoneMarker(buckets); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// migrateBucket re-encrypts up to limit records in scheme:namespace from the
+// old master-key DEK to the new derived DEK. Returns (n, done, err) where n
+// is the number of records processed and done is true when the bucket is fully
+// migrated.
+func (s *Keeper) migrateBucket(scheme, namespace string, limit int) (n int, done bool, err error) {
+	// s.master is protected by s.mu. Hold RLock only for the memguard open+copy;
+	// the expensive bbolt work below must not hold it.
+	s.mu.RLock()
+	masterBytes, err := s.master.Bytes()
+	s.mu.RUnlock()
+	if err != nil {
+		return 0, false, err
+	}
+	oldKey := make([]byte, len(masterBytes))
+	copy(oldKey, masterBytes)
+	zero.Bytes(masterBytes)
+	defer zero.Bytes(oldKey)
+
+	newKey, err := deriveBucketDEK(oldKey, scheme, namespace)
+	if err != nil {
+		return 0, false, err
+	}
+	defer zero.Bytes(newKey)
+
+	// Read the WAL cursor for this bucket.
+	walKey := metaBucketDEKWALPrefix + scheme + ":" + namespace
+	var cursorAfter string
+	_ = s.db.View(func(tx pkgstore.Tx) error {
+		b := tx.Bucket([]byte(metaBucket))
+		if b != nil {
+			if v := b.Get([]byte(walKey)); v != nil {
+				cursorAfter = string(v)
+			}
+		}
+		return nil
+	})
+
+	// Collect keys to migrate.
+	var keys []string
+	_ = s.db.View(func(tx pkgstore.Tx) error {
+		nb := s.getNamespaceBucket(tx, scheme, namespace)
+		if nb == nil {
+			return nil
+		}
+		return nb.ForEach(func(k, _ []byte) error {
+			ks := string(k)
+			if ks == metadataKey {
+				return nil
+			}
+			if cursorAfter == "" || ks > cursorAfter {
+				keys = append(keys, ks)
+			}
+			return nil
+		})
+	})
+
+	if len(keys) == 0 {
+		return 0, true, nil // bucket fully migrated
+	}
+
+	processed := 0
+	for _, key := range keys {
+		if processed >= limit {
+			return processed, false, nil
+		}
+		if err := s.migrateRecord(scheme, namespace, key, oldKey, newKey, walKey); err != nil {
+			return processed, false, err
+		}
+		processed++
+	}
+
+	// If we processed all keys the bucket is done.
+	done = processed == len(keys)
+	if done {
+		// Clear the WAL cursor for this bucket.
+		_ = s.db.Update(func(tx pkgstore.Tx) error {
+			b := tx.Bucket([]byte(metaBucket))
+			if b != nil {
+				_ = b.Delete([]byte(walKey))
+			}
+			return nil
+		})
+	}
+
+	if s.config.BucketDEKMigrationProgress != nil {
+		s.config.BucketDEKMigrationProgress(scheme, namespace, processed, len(keys))
+	}
+
+	return processed, done, nil
+}
+
+// migrateRecord re-encrypts a single secret record from oldKey to newKey in
+// one atomic bbolt.Update and advances the WAL cursor.
+func (s *Keeper) migrateRecord(scheme, namespace, key string, oldKey, newKey []byte, walKey string) error {
+	return s.db.Update(func(tx pkgstore.Tx) error {
+		nb := s.getNamespaceBucket(tx, scheme, namespace)
+		if nb == nil {
+			return nil
+		}
+		data := nb.Get([]byte(key))
+		if data == nil {
+			return nil
+		}
+		var secret Secret
+		if err := unmarshalSecret(data, &secret); err != nil {
+			return fmt.Errorf("migrate unmarshal %s: %w", key, err)
+		}
+
+		// Try decrypting with newKey first (already migrated records).
+		// Fall back to oldKey for unmigrated records.
+		pt, err := s.decryptWithKey(secret.Ciphertext, newKey)
+		if err != nil {
+			pt, err = s.decryptWithKey(secret.Ciphertext, oldKey)
+			if err != nil {
+				return fmt.Errorf("migrate decrypt %s: %w", key, err)
+			}
+		}
+
+		ct, err := s.encryptWithKey(pt, newKey)
+		zero.Bytes(pt)
+		if err != nil {
+			return fmt.Errorf("migrate encrypt %s: %w", key, err)
+		}
+		secret.Ciphertext = ct
+
+		// Re-encrypt metadata if present.
+		if len(secret.EncryptedMeta) > 0 {
+			oldMetaKey, merr := s.deriveMetaKey(oldKey)
+			if merr == nil {
+				meta, merr2 := s.decryptMetaWithKey(secret.EncryptedMeta, oldMetaKey)
+				zero.Bytes(oldMetaKey)
+				if merr2 == nil {
+					newMetaKey, merr3 := s.deriveMetaKey(newKey)
+					if merr3 == nil {
+						newEM, merr4 := s.encryptMetaWithKey(meta, newMetaKey)
+						zero.Bytes(newMetaKey)
+						if merr4 == nil {
+							secret.EncryptedMeta = newEM
+						}
+					}
+				}
+			}
+		}
+
+		encoded, err := marshalSecret(&secret)
+		if err != nil {
+			return err
+		}
+		if err := nb.Put([]byte(key), encoded); err != nil {
+			return err
+		}
+
+		// Advance WAL cursor.
+		b := tx.Bucket([]byte(metaBucket))
+		if b != nil {
+			_ = b.Put([]byte(walKey), []byte(key))
+		}
+		return nil
+	})
+}
+
+// writeMigrationDoneMarker writes the completion marker and deletes all WAL
+// cursor entries in a single atomic transaction.
+type migrationBucket struct{ scheme, namespace string }
+
+func (s *Keeper) writeMigrationDoneMarker(buckets []migrationBucket) error {
+	return s.db.Update(func(tx pkgstore.Tx) error {
+		b := tx.Bucket([]byte(metaBucket))
+		if b == nil {
+			return nil
+		}
+		if err := b.Put([]byte(metaBucketDEKDoneKey), []byte("1")); err != nil {
+			return err
+		}
+		for _, bk := range buckets {
+			walKey := metaBucketDEKWALPrefix + bk.scheme + ":" + bk.namespace
+			_ = b.Delete([]byte(walKey))
+		}
+		return nil
+	})
 }

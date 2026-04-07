@@ -51,10 +51,12 @@ afterwards. You can mix security levels freely within the same scheme.
 
 ### LevelPasswordOnly
 
-The bucket DEK is the master key itself. All `LevelPasswordOnly` buckets are
-unlocked automatically when `UnlockDatabase` is called with the correct master
-passphrase. No per-bucket credential is required at runtime. This level is
-appropriate for secrets the process needs at startup without human interaction.
+The bucket DEK is derived from the master key using HKDF-SHA256 with a
+domain-separated info string per bucket (`keeper-bucket-dek-v1:scheme:namespace`).
+All `LevelPasswordOnly` buckets are unlocked automatically when
+`UnlockDatabase` is called with the correct master passphrase. No per-bucket
+credential is required at runtime. This level is appropriate for secrets the
+process needs at startup without human interaction.
 
 ### LevelAdminWrapped
 
@@ -95,7 +97,7 @@ provided in `pkg/remote`. For production use, configure `TLSClientCert` and
 ### Master key derivation
 
 ```
-salt ← random 32 bytes, generated once, stored as a versioned SaltStore
+salt ← random 32 bytes, generated once, stored as a versioned SaltStore (unencrypted)
 masterKey ← Argon2id(passphrase, salt, t=3, m=64 MiB, p=4) → 32 bytes
 ```
 
@@ -107,6 +109,11 @@ verifyHash ← Argon2id(masterKey, "verification", t=1, m=64 MiB, p=4) → 32 by
 
 Subsequent `DeriveMaster` calls recompute this hash and compare it with
 `crypto/subtle.ConstantTimeCompare`. A mismatch returns `ErrInvalidPassphrase`.
+
+The KDF salt is stored **unencrypted** by design. It must be readable before
+`UnlockDatabase` to derive the master key — encrypting it with a key derived
+from the master would be circular. A KDF salt is not a secret; its purpose is
+uniqueness, not confidentiality.
 
 ### Secret encryption
 
@@ -141,7 +148,7 @@ obtains the wrapped DEK and the HKDF salt but cannot derive the KEK without the
 master key. An attacker who compromises only the master key cannot unwrap any
 `LevelAdminWrapped` DEK without also knowing the admin credential.
 
-### Metadata encryption
+### Metadata encryption — secrets
 
 Secret metadata (creation time, update time, access count, version) is
 encrypted separately from the ciphertext:
@@ -156,15 +163,56 @@ metadata is inaccessible without the bucket credential, preventing an attacker
 with read access to the database file from learning access patterns or
 timestamps.
 
+### Metadata encryption — policies, WAL, and audit
+
+All structural metadata is also encrypted at rest. Two keys are derived from
+the master key at `UnlockDatabase` time:
+
+```
+policyEncKey ← HKDF-SHA256(masterKey, nil, info="keeper-policy-enc-v1") → 32 bytes
+auditEncKey  ← HKDF-SHA256(masterKey, nil, info="keeper-audit-enc-v1")  → 32 bytes
+```
+
+`policyEncKey` encrypts: `BucketSecurityPolicy` values and the rotation WAL.
+
+`auditEncKey` encrypts: the `Scheme`, `Namespace`, and `Details` fields of
+every audit event.
+
+Both keys are cleared from memory at `Lock()`. The cipher used for metadata
+encryption is the same configurable `crypt.Cipher` interface used for secrets —
+the user's cipher choice (AES-256-GCM for FIPS, XChaCha20-Poly1305 by default)
+flows through automatically.
+
+Wire format for all encrypted metadata blobs:
+
+```
+nonce (cipher.NonceSize() bytes) || AEAD-ciphertext
+```
+
+### Policy bucket key hashing
+
+On-disk policy keys are opaque hashes rather than plaintext `scheme:namespace`
+strings, preventing offline enumeration of bucket names:
+
+```
+base ← hex(SHA-256("scheme:namespace"))[:32]   // 32 hex chars = 128-bit key space
+_policies/<base>          → encrypted BucketSecurityPolicy
+_policies/<base>__hash__  → SHA-256(encrypted policy bytes)
+_policies/<base>__hmac__  → HMAC-SHA256(policyKey, encrypted policy bytes)
+```
+
+The in-memory `schemeRegistry` continues to use `"scheme:namespace"` as its
+key — only the on-disk representation changes.
+
 ### Policy authentication
 
 Each policy record carries two integrity tags written atomically in one bbolt
 transaction:
 
 ```
-hash ← SHA-256(policyJSON)                         — unauthenticated, verified before unlock
+hash ← SHA-256(encryptedPolicyBytes)                         — unauthenticated, pre-unlock integrity
 policyKey ← HKDF-SHA256(masterKey, nil, info="keeper-policy-hmac-v1") → 32 bytes
-hmac ← HMAC-SHA256(policyKey, policyJSON)          — authenticated, verified after unlock
+hmac ← HMAC-SHA256(policyKey, encryptedPolicyBytes)          — authenticated, post-unlock integrity
 ```
 
 Before `UnlockDatabase`, only the SHA-256 hash is available. After unlock,
@@ -193,11 +241,13 @@ passphrase
     │
     └─ Argon2id(salt) ──→ masterKey (32 bytes, memguard Enclave)
                               │
-                              ├─ HKDF("keeper-audit-hmac-v1")  ──→ auditKey
-                              ├─ HKDF("keeper-policy-hmac-v1") ──→ policyKey
+                              ├─ HKDF("keeper-audit-hmac-v1")  ──→ auditKey    (HMAC signing)
+                              ├─ HKDF("keeper-audit-enc-v1")   ──→ auditEncKey (audit field encryption)
+                              ├─ HKDF("keeper-policy-hmac-v1") ──→ policyKey   (policy HMAC)
+                              ├─ HKDF("keeper-policy-enc-v1")  ──→ policyEncKey (policy/WAL encryption)
                               │
                               ├─ [LevelPasswordOnly]
-                              │       └─ DEK = masterKey
+                              │       └─ HKDF("keeper-bucket-dek-v1:scheme:ns") ──→ DEK
                               │               └─ HKDF("keeper-metadata-v1") ──→ metaKey
                               │
                               ├─ [LevelAdminWrapped]
@@ -225,14 +275,18 @@ never written to disk in any form.
 
 The underlying database is bbolt. All buckets and their contents:
 
-| bbolt bucket | Key format | Value format |
+| bbolt bucket | Key | Value |
 |---|---|---|
-| `metadata` | string | raw bytes / JSON (salt store, verification hash, rotation WAL) |
-| `__policies__` | `scheme:namespace` | JSON — BucketSecurityPolicy |
-| `__policies__` | `scheme:namespace:hash` | hex SHA-256 of policy JSON |
-| `__policies__` | `scheme:namespace:hmac` | hex HMAC-SHA256(policyKey, policy JSON) |
+| `__meta__` | `salt` | msgpack — SaltStore (unencrypted; circular dependency if encrypted) |
+| `__meta__` | `verify` | raw bytes — Argon2id verification hash |
+| `__meta__` | `rotation_wal` | `nonce‖AEAD(msgpack(RotationWAL))` |
+| `__meta__` | `bucket_dek_done` | `"1"` — DEK migration completion marker |
+| `__policies__` | `hex(SHA-256(scheme:ns))[:32]` | `nonce‖AEAD(msgpack(BucketSecurityPolicy))` |
+| `__policies__` | `<base>__hash__` | hex SHA-256 of encrypted policy bytes |
+| `__policies__` | `<base>__hmac__` | hex HMAC-SHA256(policyKey, encrypted policy bytes) |
 | `__audit__/scheme/namespace` | event UUID | JSON — audit Event |
-| `scheme/namespace/key` | key string | msgpack — Secret struct |
+| `__audit__/scheme/namespace` | `__chain_index__` | JSON — chainIndex |
+| `scheme/namespace` | key string | msgpack — Secret struct |
 
 ### Secret struct (msgpack)
 
@@ -244,11 +298,26 @@ type Secret struct {
 }
 ```
 
+### Audit Event fields
+
+The `Event` struct uses separate plaintext routing fields (`Scheme`,
+`Namespace`) alongside encrypted payload fields (`EncScheme`, `EncNamespace`,
+`EncDetails`). Checksums are computed over the plaintext routing fields and the
+encrypted `EncDetails` bytes, so chain integrity can be verified at three tiers
+without any key:
+
+| Tier | Has | Can verify |
+|---|---|---|
+| Public | Nothing | SHA-256 checksum chain (detects tampering and insertion) |
+| Audit-key holder | `auditEncKey` | Full chain + decrypt Scheme/Namespace/Details |
+| Operator | Master passphrase | Everything |
+
 ### Versioned salt store
 
-The KDF salt is stored as a JSON-encoded `SaltStore` under the `salt` metadata
-key. Each salt rotation appends a new `SaltEntry` and advances
-`CurrentVersion`. Old entries are retained as an audit trail.
+The KDF salt is stored as a msgpack-encoded `SaltStore` under the `salt`
+metadata key. Each salt rotation appends a new `SaltEntry` and advances
+`CurrentVersion`. Old entries are retained as an audit trail. The SaltStore is
+stored unencrypted — see [Security decisions](#security-decisions).
 
 ### Crash-safe rotation WAL
 
@@ -257,7 +326,7 @@ key. Each salt rotation appends a new `SaltEntry` and advances
 After a crash the old passphrase is gone; `WrappedOldKey` is the only correct
 way to carry the old key across the boundary. At `UnlockDatabase`, when a WAL
 is present, the new master key decrypts `WrappedOldKey` and rotation resumes
-from the WAL cursor.
+from the WAL cursor. The WAL itself is encrypted with `policyEncKey`.
 
 ---
 
@@ -267,9 +336,9 @@ Every significant operation appends a tamper-evident event to the bucket's
 audit chain. Chain integrity depends on two mechanisms.
 
 **Checksum.** SHA-256 over prevChecksum, ID, BucketID, Scheme, Namespace,
-Details, EventType, and Timestamp. Covering ID, BucketID, Scheme, and Namespace
-prevents an event from one chain being transplanted to another without
-detection.
+EncDetails, EventType, and Timestamp. Using `Scheme`/`Namespace` as plaintext
+(always preserved alongside the encrypted forms) ensures the checksum is stable
+across load paths. `EncDetails` provides integrity over the encrypted payload.
 
 **HMAC.** HMAC-SHA256 over all fields including Seq. An attacker who can write
 to the database but does not know the audit key cannot produce a valid HMAC.
@@ -277,7 +346,9 @@ to the database but does not know the audit key cannot produce a valid HMAC.
 
 **Key rotation epoch boundary.** At `Rotate`, a checkpoint event is appended
 to every active chain carrying fingerprints of both the outgoing and incoming
-audit keys. The checkpoint is signed with the outgoing key.
+audit keys. The checkpoint is signed with the outgoing key. Auditors holding
+any epoch key can recover subsequent epoch keys from the `wrapped_new_key` field
+and verify HMAC continuity across the full chain.
 
 **Automatic pruning.** When `AuditPruneInterval` is set in `Config`, a
 `jack.Scheduler` runs periodically and calls `PruneEvents` on every registered
@@ -314,7 +385,9 @@ cmds := &keepcmd.Commands{
     NoClose: false, // true in REPL / session contexts
 }
 
-cmds.List()
+cmds.List()                                          // all keys: scheme://namespace/key
+cmds.List("vault")                                   // all keys in scheme vault
+cmds.List("vault", "system")                         // all keys in vault://system
 cmds.Get("vault://system/jwt_secret")
 cmds.Set("vault://system/jwt_secret", "newsecret", keepcmd.SetOptions{})
 cmds.Rotate(newPassphraseBytes)    // caller resolved the passphrase — no prompter dependency
@@ -343,7 +416,6 @@ import "github.com/agberohq/keeper/x/keephandler"
 keephandler.Mount(mux, store,
     keephandler.WithPrefix("/api/keeper"),
     keephandler.WithGuard(func(w http.ResponseWriter, r *http.Request, route string) bool {
-        // principal-level access control per route
         if !acl.Allow(r.Header.Get("X-Principal"), route) {
             http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
             return false
@@ -360,7 +432,6 @@ keephandler.Mount(mux, store,
         },
     ),
     keephandler.WithEncoder(func(w http.ResponseWriter, route string, status int, data any) {
-        // custom envelope — add tenant ID, trace ID, etc.
         w.Header().Set("Content-Type", "application/json")
         w.WriteHeader(status)
         json.NewEncoder(w).Encode(map[string]any{
@@ -370,7 +441,6 @@ keephandler.Mount(mux, store,
         })
     }),
     keephandler.WithRoutes(func(m *http.ServeMux) {
-        // application-specific extensions
         m.HandleFunc("POST /api/keeper/totp/{user}", myTOTPHandler)
     }),
 )
@@ -433,9 +503,16 @@ if err := store.Unlock([]byte(os.Getenv("KEEPER_PASSPHRASE"))); err != nil {
 }
 ```
 
-If the process crashed mid-rotation on a previous run, `UnlockDatabase`
-detects the WAL, recovers the old key from `WrappedOldKey`, and completes the
-remaining records automatically before proceeding.
+`UnlockDatabase` performs the following in order:
+
+1. Derives and activates the audit HMAC signing key
+2. Derives and activates the policy HMAC key
+3. Derives and activates `policyEncKey` and `auditEncKey`
+4. Clears and reloads `schemeRegistry` (decrypts all policy blobs)
+5. Resumes any interrupted rotation WAL
+6. Upgrades policy HMAC tags
+7. Seeds all `LevelPasswordOnly` bucket DEKs into the Envelope
+8. Starts background tasks (migration looper, auto-lock, health patients)
 
 ### LevelPasswordOnly bucket — full lifecycle
 
@@ -488,6 +565,17 @@ cfg.TLSClientKey  = "/etc/keeper/client.key"
 provider, _ = remote.New(cfg)
 store.RegisterHSMProvider("tenant", "secrets", provider)
 store.CreateBucket("tenant", "secrets", keeper.LevelRemote, "ops")
+```
+
+### Audit key export
+
+```go
+// Export the audit encryption key to allow a third-party auditor to decrypt
+// event details without access to the master passphrase.
+auditKey, err := store.ExportAuditKey()
+defer zero.Bytes(auditKey)
+
+events, err := auditStore.LoadChain("vault", "system", auditKey)
 ```
 
 ### Key rotation
@@ -568,9 +656,28 @@ off the long-lived heap. The `[]byte` copy is zeroed with `wipeBytes` after use.
 history. The CLI accepts the passphrase only from `KEEPER_PASSPHRASE` env or
 an interactive no-echo prompt.
 
-**REPL secret values are never visible.** `set <key>` in the REPL uses
-`term.ReadPassword` for the value — it does not appear in terminal scrollback,
-shell history, or `ps`.
+**REPL secret values are never visible.** `set <key>` in the REPL without an
+inline value uses `term.ReadPassword` — it does not appear in terminal
+scrollback, shell history, or `ps`. An inline value (`set key value`) can be
+supplied for non-sensitive data when convenient.
+
+**SaltStore is intentionally unencrypted.** The KDF salt must be readable
+before `UnlockDatabase` to derive the master key. `policyEncKey` (used for all
+other metadata encryption) is itself derived from the master key — encrypting
+the salt with `policyEncKey` would be circular. A KDF salt provides uniqueness,
+not confidentiality; there is no security value in encrypting it.
+
+**Policy bucket keys are hashed, not plaintext.** On-disk policy keys are
+`hex(SHA-256("scheme:namespace"))[:32]` — 128 bits of key space — rather than
+readable strings. An offline attacker reading the bbolt file cannot enumerate
+bucket names without decrypting the policy blobs.
+
+**Metadata encryption uses the same cipher interface as secrets.** All
+`policyEncKey` and `auditEncKey` operations go through `s.config.NewCipher(key)`
+— the same `crypt.Cipher` interface configured for secret values. The user's
+cipher choice (AES-256-GCM for FIPS 140, XChaCha20-Poly1305 by default) flows
+through to policy, WAL, and audit encryption automatically. No code path
+hard-codes a specific algorithm.
 
 **LevelHSM and LevelRemote buckets skipped during master key rotation.**
 `reencryptAllWithKey` and `RotateSalt` explicitly skip these buckets. The DEK
@@ -580,3 +687,21 @@ is provider-controlled; master salt rotation does not affect it.
 touching any record. The WAL carries `WrappedOldKey`: the pre-rotation master
 key encrypted with the new master key. After a crash, `UnlockDatabase` decrypts
 `WrappedOldKey` using the verified new key and resumes rotation from the cursor.
+
+---
+
+## Dependencies
+
+| Package | Purpose |
+|---|---|
+| `go.etcd.io/bbolt` | Embedded key-value store |
+| `golang.org/x/crypto` | Argon2id, XChaCha20-Poly1305, HKDF, scrypt |
+| `github.com/awnumar/memguard` | Memory-safe key enclave (master key, DEKs) |
+| `github.com/vmihailenco/msgpack/v5` | Binary serialisation for secrets and policies |
+| `github.com/olekukonko/jack` | Process supervision (optional Jack integration) |
+| `github.com/olekukonko/ll` | Structured logging |
+| `github.com/olekukonko/errors` | Sentinel errors with stack traces |
+| `github.com/olekukonko/zero` | Safe byte-slice zeroing |
+| `github.com/olekukonko/prompter` | No-echo terminal prompts (CLI only) |
+| `github.com/integrii/flaggy` | CLI flag parsing (cmd/keeper only) |
+| `golang.org/x/term` | TTY detection and raw password reading (CLI only) |

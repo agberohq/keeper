@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/agberohq/keeper/pkg/prompter"
+	"github.com/olekukonko/prompter"
 )
 
 // pickDB asks the user to select from multiple .db files found in the current

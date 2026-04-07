@@ -12,31 +12,34 @@ import (
 type BucketEvent = pkgaudit.Event
 
 // BucketSecurityPolicy is immutable after creation.
+// On-disk encoding: msgpack (new databases) or JSON (legacy, migrated on unlock).
+// Audit events referencing this policy remain JSON — they are intentionally
+// human-readable and verified without the passphrase.
 type BucketSecurityPolicy struct {
-	ID                string        `json:"id"`
-	Scheme            string        `json:"scheme"`
-	Namespace         string        `json:"namespace"`
-	Level             SecurityLevel `json:"level"`
-	CreatedAt         time.Time     `json:"created_at"`
-	CreatedBy         string        `json:"created_by"`
-	EncryptionVersion int           `json:"encryption_version"`
+	ID                string        `json:"id"                   msgpack:"id"`
+	Scheme            string        `json:"scheme"               msgpack:"scheme"`
+	Namespace         string        `json:"namespace"            msgpack:"namespace"`
+	Level             SecurityLevel `json:"level"                msgpack:"level"`
+	CreatedAt         time.Time     `json:"created_at"           msgpack:"created_at"`
+	CreatedBy         string        `json:"created_by"           msgpack:"created_by"`
+	EncryptionVersion int           `json:"encryption_version"   msgpack:"encryption_version"`
 
 	// LastRekeyed records when RotateAdminWrappedDEK last succeeded.
 	// A zero value means the bucket predates this field and should be treated
 	// as needing re-keying when NeedsAdminRekey is called after a salt rotation.
-	LastRekeyed time.Time `json:"last_rekeyed,omitempty"`
+	LastRekeyed time.Time `json:"last_rekeyed,omitempty" msgpack:"last_rekeyed,omitempty"`
 
 	// LevelAdminWrapped only:
-	DEKSalt     []byte            `json:"dek_salt,omitempty"`
-	WrappedDEKs map[string][]byte `json:"wrapped_deks,omitempty"`
+	DEKSalt     []byte            `json:"dek_salt,omitempty"   msgpack:"dek_salt,omitempty"`
+	WrappedDEKs map[string][]byte `json:"wrapped_deks,omitempty" msgpack:"wrapped_deks,omitempty"`
 
 	// HSMProvider is required for LevelHSM and LevelRemote buckets.
-	// It is excluded from JSON serialisation — callers must register it via
-	// Keeper.RegisterHSMProvider after opening the database.
-	HSMProvider HSMProvider `json:"-"`
+	// Excluded from both JSON and msgpack serialisation — callers must
+	// register it via Keeper.RegisterHSMProvider after opening the database.
+	HSMProvider HSMProvider `json:"-" msgpack:"-"`
 
 	// Handler provides optional pre/post-processing hooks for this bucket.
-	Handler SchemeHandler `json:"-"`
+	Handler SchemeHandler `json:"-" msgpack:"-"`
 }
 
 // Validate checks policy constraints before creation.

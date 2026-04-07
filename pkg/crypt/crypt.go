@@ -14,6 +14,12 @@ type Cipher interface {
 	// Decrypt recovers plaintext from ciphertext produced by Encrypt.
 	// Returns ErrDecrypt on authentication failure or truncation.
 	Decrypt(ciphertext []byte) ([]byte, error)
+
+	// KeySize returns the number of bytes this cipher requires for its key.
+	// Used by key-derivation paths to produce correctly-sized keys without
+	// hard-coding algorithm-specific constants (e.g. 32 for XChaCha20-Poly1305
+	// and AES-256-GCM, 16 for AES-128-GCM).
+	KeySize() int
 }
 
 // KDF is the key-derivation contract.

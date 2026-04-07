@@ -1,4 +1,4 @@
-package remote_test
+package remote
 
 import (
 	"context"
@@ -7,8 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-
-	"github.com/agberohq/keeper/pkg/remote"
 )
 
 // fakeKMS is a minimal in-memory KMS that base64-encodes on wrap and decodes on unwrap.
@@ -51,14 +49,14 @@ func newTestServer(t *testing.T, f *fakeKMS) *httptest.Server {
 func TestProvider_WrapUnwrap(t *testing.T) {
 	f := &fakeKMS{}
 	srv := newTestServer(t, f)
-	cfg := remote.Config{
+	cfg := Config{
 		URL:                    srv.URL,
 		WrapRequestTemplate:    `{"plaintext":"{{.DEK}}"}`,
 		WrapResponseJSONPath:   "ciphertext",
 		UnwrapRequestTemplate:  `{"ciphertext":"{{.Wrapped}}"}`,
 		UnwrapResponseJSONPath: "plaintext",
 	}
-	p, err := remote.New(cfg)
+	p, err := New(cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -84,7 +82,7 @@ func TestProvider_WrapUnwrap(t *testing.T) {
 func TestProvider_RetryOn503(t *testing.T) {
 	f := &fakeKMS{failCount: 2}
 	srv := newTestServer(t, f)
-	cfg := remote.Config{
+	cfg := Config{
 		URL:                    srv.URL,
 		WrapRequestTemplate:    `{"plaintext":"{{.DEK}}"}`,
 		WrapResponseJSONPath:   "ciphertext",
@@ -92,7 +90,7 @@ func TestProvider_RetryOn503(t *testing.T) {
 		UnwrapResponseJSONPath: "plaintext",
 		RetryCount:             3,
 	}
-	p, err := remote.New(cfg)
+	p, err := New(cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -116,7 +114,7 @@ func TestProvider_Ping(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	p, err := remote.New(remote.Config{URL: srv.URL})
+	p, err := New(Config{URL: srv.URL})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

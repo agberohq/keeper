@@ -46,10 +46,25 @@ var (
 type SecurityLevel string
 
 // SchemeHandler allows custom pre/post processing per scheme.
+// All Pre* hooks run before the operation; returning an error aborts it.
+// All Post* hooks run after a successful commit; their errors are logged
+// but do not roll back the already-committed operation.
 type SchemeHandler interface {
-	PreSet(scheme, namespace, key string, value []byte) ([]byte, error)
+	// Read
+	PreGet(scheme, namespace, key string) error
 	PostGet(scheme, namespace, key string, value []byte) ([]byte, error)
-	OnDelete(scheme, namespace, key string) error
+
+	// Write
+	PreSet(scheme, namespace, key string, value []byte) ([]byte, error)
+	PostSet(scheme, namespace, key string, value []byte)
+
+	// Delete
+	PreDelete(scheme, namespace, key string) error
+	PostDelete(scheme, namespace, key string)
+
+	// Compare-and-swap
+	PreCAS(scheme, namespace, key string, oldValue, newValue []byte) error
+	PostCAS(scheme, namespace, key string, newValue []byte)
 }
 
 // HSMProvider abstracts wrap/unwrap operations for LevelHSM and LevelRemote buckets.
@@ -62,11 +77,29 @@ type HSMProvider interface {
 }
 
 // Hooks injects custom logic at key lifecycle points.
+// All Pre* hooks run before the operation and may abort it by returning an error.
+// All Post* hooks run after a successful commit; returning an error from a Post*
+// hook logs the error but does NOT roll back the already-committed operation.
+// Any hook field left nil is a no-op.
 type Hooks struct {
-	PreSet    func(scheme, namespace, key string, value []byte) ([]byte, error)
-	PostGet   func(scheme, namespace, key string, value []byte) ([]byte, error)
-	PreDelete func(scheme, namespace, key string) error
-	OnAudit   func(action, scheme, namespace, key string, success bool, duration time.Duration)
+	// Read
+	PreGet  func(scheme, namespace, key string) error
+	PostGet func(scheme, namespace, key string, value []byte) ([]byte, error)
+
+	// Write
+	PreSet  func(scheme, namespace, key string, value []byte) ([]byte, error)
+	PostSet func(scheme, namespace, key string, value []byte)
+
+	// Delete
+	PreDelete  func(scheme, namespace, key string) error
+	PostDelete func(scheme, namespace, key string)
+
+	// Compare-and-swap
+	PreCAS  func(scheme, namespace, key string, oldValue, newValue []byte) error
+	PostCAS func(scheme, namespace, key string, newValue []byte)
+
+	// Audit — called after every operation regardless of success.
+	OnAudit func(action, scheme, namespace, key string, success bool, duration time.Duration)
 }
 
 // JackPool is the subset of jack.Pool that keeper uses.
@@ -100,6 +133,35 @@ type JackConfig struct {
 	Doctor   JackDoctor
 }
 
+// MigrationState reports the per-bucket DEK derivation migration status.
+// Returned by Keeper.MigrationStatus and surfaced in GET /keeper/status.
+type MigrationState int
+
+const (
+	// MigrationNotNeeded means the database was created after per-bucket DEK
+	// derivation was introduced; no migration is required.
+	MigrationNotNeeded MigrationState = iota
+	// MigrationInProgress means the background looper is still re-encrypting
+	// records from the old master-key-as-DEK format.
+	MigrationInProgress
+	// MigrationDone means all LevelPasswordOnly records have been re-encrypted
+	// under their per-bucket derived DEK.
+	MigrationDone
+)
+
+func (m MigrationState) String() string {
+	switch m {
+	case MigrationNotNeeded:
+		return "not_needed"
+	case MigrationInProgress:
+		return "in_progress"
+	case MigrationDone:
+		return "done"
+	default:
+		return "unknown"
+	}
+}
+
 // Config holds all configuration for a Keeper instance.
 type Config struct {
 	DBPath           string
@@ -127,6 +189,20 @@ type Config struct {
 
 	KDF       crypt.KDF
 	NewCipher func(key []byte) (crypt.Cipher, error)
+
+	// BucketDEKMigrationBatchSize is the number of records to re-encrypt per
+	// migration looper tick. Default 500. Reduce to 50 in I/O-constrained
+	// environments to limit write amplification.
+	BucketDEKMigrationBatchSize int
+
+	// BucketDEKMigrationInterval is the pause between migration batches.
+	// Default 100ms. At defaults: 100k records migrate in ~20s with no
+	// perceptible service impact.
+	BucketDEKMigrationInterval time.Duration
+
+	// BucketDEKMigrationProgress is called after each batch with cumulative
+	// progress. Optional — safe to leave nil.
+	BucketDEKMigrationProgress func(scheme, namespace string, done, total int)
 
 	Argon2Time              uint32
 	Argon2Memory            uint32
@@ -156,17 +232,17 @@ type EncryptedMetadata struct {
 
 // SaltEntry records one generation of the KDF salt.
 type SaltEntry struct {
-	Version   int       `json:"v"`
-	Salt      []byte    `json:"s"`
-	CreatedAt time.Time `json:"ca"`
+	Version   int       `json:"v"    msgpack:"v"`
+	Salt      []byte    `json:"s"    msgpack:"s"`
+	CreatedAt time.Time `json:"ca"   msgpack:"ca"`
 }
 
 // SaltStore is the versioned salt container stored under metaSaltKey.
 // CurrentVersion indexes into Entries. Old entries are retained as an
 // audit trail and for crash-recovery during salt rotation.
 type SaltStore struct {
-	CurrentVersion int         `json:"current"`
-	Entries        []SaltEntry `json:"entries"`
+	CurrentVersion int         `json:"current"  msgpack:"current"`
+	Entries        []SaltEntry `json:"entries"  msgpack:"entries"`
 }
 
 // RotationWAL tracks the state of an in-progress key rotation.
@@ -177,13 +253,13 @@ type SaltStore struct {
 // key using XChaCha20-Poly1305. It is the only safe way to carry the old
 // key across a crash boundary without storing it in plaintext.
 type RotationWAL struct {
-	Status        string    `json:"status"`
-	OldKeyHash    []byte    `json:"old_hash"`
-	NewKeyHash    []byte    `json:"new_hash"`
-	StartedAt     time.Time `json:"started"`
-	LastKey       string    `json:"last_key"`
-	SaltVersion   int       `json:"salt_ver"`
-	WrappedOldKey []byte    `json:"wrapped_old_key"`
+	Status        string    `json:"status"          msgpack:"status"`
+	OldKeyHash    []byte    `json:"old_hash"        msgpack:"old_hash"`
+	NewKeyHash    []byte    `json:"new_hash"        msgpack:"new_hash"`
+	StartedAt     time.Time `json:"started"         msgpack:"started"`
+	LastKey       string    `json:"last_key"        msgpack:"last_key"`
+	SaltVersion   int       `json:"salt_ver"        msgpack:"salt_ver"`
+	WrappedOldKey []byte    `json:"wrapped_old_key" msgpack:"wrapped_old_key"`
 }
 
 // NamespaceStats holds aggregate statistics for one namespace.

@@ -1,13 +1,36 @@
 package keeper
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"time"
 
 	pkgaudit "github.com/agberohq/keeper/pkg/audit"
 	"github.com/olekukonko/zero"
+	"golang.org/x/crypto/chacha20poly1305"
 )
+
+// wrapAuditKey encrypts newKey with oldKey using XChaCha20-Poly1305.
+// The result is base64-encoded for embedding in JSON checkpoint Details.
+// Returns "" on any failure — checkpoint is still written; auditors fall back
+// to checksum-only verification for the new epoch.
+func wrapAuditKey(oldKey, newKey []byte) string {
+	if len(oldKey) == 0 || len(newKey) == 0 {
+		return ""
+	}
+	aead, err := chacha20poly1305.NewX(oldKey)
+	if err != nil {
+		return ""
+	}
+	nonce := make([]byte, aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return ""
+	}
+	ct := aead.Seal(nonce, nonce, newKey, nil)
+	return base64.StdEncoding.EncodeToString(ct)
+}
 
 // Unlock derives a Master key from passphrase bytes and calls UnlockDatabase.
 // Passphrase bytes are NOT zeroed by this method — the caller owns them.
@@ -64,11 +87,8 @@ func (s *Keeper) RotateSalt(passphrase []byte) error {
 		return fmt.Errorf("failed to store verification hash: %w", err)
 	}
 
-	newMaster, err := NewMaster(newKey)
-	if err != nil {
-		return fmt.Errorf("failed to create new master: %w", err)
-	}
-
+	// Derive all keys from newKey BEFORE NewMaster: memguard.NewEnclave wipes
+	// its input, so any derivation after NewMaster(newKey) uses zeroed bytes.
 	oldAuditKey, err := deriveAuditKey(oldKey)
 	if err != nil {
 		return fmt.Errorf("failed to derive old audit key: %w", err)
@@ -78,6 +98,29 @@ func (s *Keeper) RotateSalt(passphrase []byte) error {
 		zero.Bytes(oldAuditKey)
 		return fmt.Errorf("failed to derive new audit key: %w", err)
 	}
+	newPolicyKey, err := derivePolicyKey(newKey)
+	if err != nil {
+		zero.Bytes(oldAuditKey)
+		zero.Bytes(newAuditKey)
+		return fmt.Errorf("failed to derive new policy key: %w", err)
+	}
+	newPolicyEncKey, _, err := deriveMetadataKeys(newKey, s.config)
+	if err != nil {
+		zero.Bytes(oldAuditKey)
+		zero.Bytes(newAuditKey)
+		zero.Bytes(newPolicyKey)
+		return fmt.Errorf("failed to derive new policy encryption key: %w", err)
+	}
+
+	// Safe to call NewMaster now — this wipes newKey via memguard.
+	newMaster, err := NewMaster(newKey)
+	if err != nil {
+		zero.Bytes(oldAuditKey)
+		zero.Bytes(newAuditKey)
+		zero.Bytes(newPolicyKey)
+		zero.Bytes(newPolicyEncKey)
+		return fmt.Errorf("failed to create new master: %w", err)
+	}
 
 	s.appendRotationCheckpoints(oldAuditKey, newAuditKey)
 	zero.Bytes(oldAuditKey)
@@ -86,13 +129,16 @@ func (s *Keeper) RotateSalt(passphrase []byte) error {
 	s.master = newMaster
 	s.auditStore.setSigningKey(newAuditKey)
 	zero.Bytes(newAuditKey)
-
-	newPolicyKey, err := derivePolicyKey(newKey)
-	if err != nil {
-		return fmt.Errorf("failed to derive new policy key: %w", err)
-	}
+	oldPolicyEncKey := make([]byte, len(s.policyEncKey))
+	copy(oldPolicyEncKey, s.policyEncKey)
+	defer zero.Bytes(oldPolicyEncKey)
 	zero.Bytes(s.policyKey)
 	s.policyKey = newPolicyKey
+	zero.Bytes(s.policyEncKey)
+	s.policyEncKey = newPolicyEncKey
+	if err := s.reencryptAllPolicies(oldPolicyEncKey); err != nil {
+		return fmt.Errorf("policy re-encryption after salt rotation failed: %w", err)
+	}
 	if err := s.upgradePolicyHMACs(); err != nil {
 		s.logger.Fields("err", err).Warn("policy HMAC rewrite after salt rotation failed — continuing")
 	}
@@ -193,14 +239,19 @@ func (s *Keeper) RotateAdminWrappedDEK(scheme, namespace, adminID string, adminP
 	dekBuf.Destroy()
 	defer zero.Bytes(dekBytes)
 
-	// Generate a fresh per-bucket DEK salt.
-	newSalt, err := GenerateDEKSalt()
-	if err != nil {
-		return fmt.Errorf("failed to generate new DEK salt: %w", err)
-	}
-
-	// Re-wrap the DEK for this admin under the new salt.
-	newKEK, err := DeriveKEK(masterBytes, adminPassword, newSalt)
+	// Re-wrap the DEK for this admin under the EXISTING policy.DEKSalt.
+	//
+	// We must NOT generate a new salt here. The DEKSalt is shared by every
+	// admin entry in WrappedDEKs: rotating it invalidates all other admins'
+	// wrapped copies because their next UnlockBucket call would derive
+	// KEK(master, theirPassword, newSalt) — a completely different KEK —
+	// and AEAD authentication would fail, permanently locking them out with
+	// no recovery path short of AddAdminToPolicy.
+	//
+	// The salt's purpose is to ensure different (master, password) pairs on
+	// different buckets produce different KEKs. When only the *password*
+	// changes the KEK already differs; the salt does not need to change.
+	newKEK, err := DeriveKEK(masterBytes, adminPassword, policy.DEKSalt)
 	if err != nil {
 		return fmt.Errorf("failed to derive new KEK: %w", err)
 	}
@@ -219,14 +270,16 @@ func (s *Keeper) RotateAdminWrappedDEK(scheme, namespace, adminID string, adminP
 		return fmt.Errorf("failed to re-wrap DEK: %w", wErr)
 	}
 
-	policy.DEKSalt = newSalt
+	// Only update this admin's entry. DEKSalt and all other WrappedDEKs are untouched.
 	policy.WrappedDEKs[adminID] = reWrapped
 	policy.LastRekeyed = time.Now()
 
 	if err := s.savePolicy(policy); err != nil {
 		return fmt.Errorf("failed to save updated policy: %w", err)
 	}
+	s.registryMu.Lock()
 	s.schemeRegistry[fmt.Sprintf("%s:%s", scheme, namespace)] = policy
+	s.registryMu.Unlock()
 	_ = s.policyChain.AppendEvent(scheme, namespace, "dek_rekeyed",
 		map[string]string{"admin": adminID})
 	s.logger.Fields("scheme", scheme, "namespace", namespace, "admin", adminID).Info("DEK re-keyed successfully")
@@ -238,10 +291,11 @@ func (s *Keeper) RotateAdminWrappedDEK(scheme, namespace, adminID string, adminP
 // are unaffected.
 //
 // After the master key changes:
-//   - The audit signing key is re-derived from the new master.
-//   - A key-rotation checkpoint event is appended to every active audit chain,
-//     signed with the old key as the final event of the old epoch and
-//     verifiable by the new key as the first event of the new epoch.
+// The audit signing key is re-derived from the new master.
+// A key-rotation checkpoint event is appended to every active audit chain,
+//
+//	signed with the old key as the final event of the old epoch and
+//	verifiable by the new key as the first event of the new epoch.
 //
 // Passphrase bytes are NOT zeroed by this method — the caller owns them.
 func (s *Keeper) Rotate(newPassphrase []byte) error {
@@ -274,13 +328,8 @@ func (s *Keeper) Rotate(newPassphrase []byte) error {
 		return fmt.Errorf("failed to store verification hash: %w", err)
 	}
 
-	newMaster, err := NewMaster(newKey)
-	if err != nil {
-		return fmt.Errorf("failed to create new master: %w", err)
-	}
-
-	// Derive the old and new audit keys before swapping the master, so we
-	// can compute both fingerprints for the checkpoint event.
+	// Derive all keys from newKey BEFORE NewMaster: memguard.NewEnclave wipes
+	// its input, so any derivation after NewMaster(newKey) uses zeroed bytes.
 	oldAuditKey, err := deriveAuditKey(oldKey)
 	if err != nil {
 		return fmt.Errorf("failed to derive old audit key: %w", err)
@@ -290,10 +339,31 @@ func (s *Keeper) Rotate(newPassphrase []byte) error {
 		zero.Bytes(oldAuditKey)
 		return fmt.Errorf("failed to derive new audit key: %w", err)
 	}
+	newPolicyKey, err := derivePolicyKey(newKey)
+	if err != nil {
+		zero.Bytes(oldAuditKey)
+		zero.Bytes(newAuditKey)
+		return fmt.Errorf("failed to derive new policy key: %w", err)
+	}
+	newPolicyEncKey, _, err := deriveMetadataKeys(newKey, s.config)
+	if err != nil {
+		zero.Bytes(oldAuditKey)
+		zero.Bytes(newAuditKey)
+		zero.Bytes(newPolicyKey)
+		return fmt.Errorf("failed to derive new policy encryption key: %w", err)
+	}
+
+	// Safe to call NewMaster now — this wipes newKey via memguard.
+	newMaster, err := NewMaster(newKey)
+	if err != nil {
+		zero.Bytes(oldAuditKey)
+		zero.Bytes(newAuditKey)
+		zero.Bytes(newPolicyKey)
+		zero.Bytes(newPolicyEncKey)
+		return fmt.Errorf("failed to create new master: %w", err)
+	}
 
 	// Append a checkpoint event to every active chain, signed with the old key.
-	// This is O(number of chains) — one small event per chain regardless of
-	// how many events are in the chain.
 	s.appendRotationCheckpoints(oldAuditKey, newAuditKey)
 	zero.Bytes(oldAuditKey)
 
@@ -302,15 +372,19 @@ func (s *Keeper) Rotate(newPassphrase []byte) error {
 	s.master = newMaster
 	s.auditStore.setSigningKey(newAuditKey)
 	zero.Bytes(newAuditKey)
-
-	// Re-derive the policy HMAC key from the new master and rewrite all
-	// policy records with the new tag.
-	newPolicyKey, err := derivePolicyKey(newKey)
-	if err != nil {
-		return fmt.Errorf("failed to derive new policy key: %w", err)
-	}
+	// Capture the old encryption key before swapping — reencryptAllPolicies needs
+	// it to decrypt the on-disk blobs that were written with the old key.
+	oldPolicyEncKey := make([]byte, len(s.policyEncKey))
+	copy(oldPolicyEncKey, s.policyEncKey)
+	defer zero.Bytes(oldPolicyEncKey)
+	// Swap keys: marshalPolicy will now use the new policyEncKey.
 	zero.Bytes(s.policyKey)
 	s.policyKey = newPolicyKey
+	zero.Bytes(s.policyEncKey)
+	s.policyEncKey = newPolicyEncKey
+	if err := s.reencryptAllPolicies(oldPolicyEncKey); err != nil {
+		return fmt.Errorf("policy re-encryption after rotation failed: %w", err)
+	}
 	if err := s.upgradePolicyHMACs(); err != nil {
 		s.logger.Fields("err", err).Warn("policy HMAC rewrite after rotation failed — continuing")
 	}
@@ -332,17 +406,29 @@ func (s *Keeper) Rotate(newPassphrase []byte) error {
 // (the last event of the old epoch). The store switches to newAuditKey
 // immediately after this call.
 //
-// The checkpoint Details carry fingerprints of both keys so an auditor can
-// verify the key transition without knowing the raw key bytes.
+// The checkpoint Details carry:
+// Fingerprints of both keys so an auditor can verify the key transition
+//
+//	without knowing the raw key bytes.
+//
+// wrapped_new_key: XChaCha20-Poly1305(oldAuditKey, newAuditKey), enabling
+//
+//	an auditor holding any epoch key to recover subsequent epoch keys and
+//	continue HMAC verification across the entire chain. See audit.epochKeyFromCheckpoint.
 func (s *Keeper) appendRotationCheckpoints(oldAuditKey, newAuditKey []byte) {
 	type checkpointDetails struct {
-		OldKeyFp string `json:"old_key_fingerprint"`
-		NewKeyFp string `json:"new_key_fingerprint"`
+		OldKeyFp      string `json:"old_key_fingerprint"`
+		NewKeyFp      string `json:"new_key_fingerprint"`
+		WrappedNewKey string `json:"wrapped_new_key"`
 	}
 
+	// Encrypt newAuditKey with oldAuditKey so auditors can chain across rotations.
+	wrappedNewKey := wrapAuditKey(oldAuditKey, newAuditKey)
+
 	details := checkpointDetails{
-		OldKeyFp: pkgaudit.KeyFingerprint(oldAuditKey),
-		NewKeyFp: pkgaudit.KeyFingerprint(newAuditKey),
+		OldKeyFp:      pkgaudit.KeyFingerprint(oldAuditKey),
+		NewKeyFp:      pkgaudit.KeyFingerprint(newAuditKey),
+		WrappedNewKey: wrappedNewKey,
 	}
 	detailsJSON, err := json.Marshal(details)
 	if err != nil {
@@ -430,9 +516,9 @@ func (s *Keeper) CompareAndSwapNamespaced(namespace, key string, oldValue, newVa
 	return s.CompareAndSwapNamespacedFull(s.defaultScheme, namespace, key, oldValue, newValue)
 }
 
-func (s *Keeper) CompareAndSwap(key, oldValue, newValue string) error {
+func (s *Keeper) CompareAndSwap(key string, oldValue, newValue []byte) error {
 	scheme, namespace, localKey := parseKeyExtended(key)
-	return s.CompareAndSwapNamespacedFull(scheme, namespace, localKey, []byte(oldValue), []byte(newValue))
+	return s.CompareAndSwapNamespacedFull(scheme, namespace, localKey, oldValue, newValue)
 }
 
 func (s *Keeper) DeleteNamespace(namespace string) error {
@@ -440,30 +526,9 @@ func (s *Keeper) DeleteNamespace(namespace string) error {
 }
 
 func (s *Keeper) Move(key, fromNS, toNS string) error {
-	_, fErr := s.GetPolicy(s.defaultScheme, fromNS)
-	_, tErr := s.GetPolicy(s.defaultScheme, toNS)
-	if fErr != nil || tErr != nil {
-		v, err := s.GetNamespaced(fromNS, key)
-		if err != nil {
-			return err
-		}
-		if err := s.SetNamespaced(toNS, key, v); err != nil {
-			return err
-		}
-		return s.DeleteNamespaced(fromNS, key)
-	}
 	return s.MoveCrossBucket(key, s.defaultScheme, fromNS, s.defaultScheme, toNS, false)
 }
 
 func (s *Keeper) Copy(key, fromNS, toNS string) error {
-	_, fErr := s.GetPolicy(s.defaultScheme, fromNS)
-	_, tErr := s.GetPolicy(s.defaultScheme, toNS)
-	if fErr != nil || tErr != nil {
-		v, err := s.GetNamespaced(fromNS, key)
-		if err != nil {
-			return err
-		}
-		return s.SetNamespaced(toNS, key, v)
-	}
 	return s.CopyCrossBucket(key, s.defaultScheme, fromNS, s.defaultScheme, toNS, false)
 }

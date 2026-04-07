@@ -15,9 +15,23 @@ import (
 	"github.com/agberohq/keeper/pkg/crypt"
 )
 
+// testConfig returns a Config with fast Argon2 parameters for tests.
+// The KDF is the bottleneck in the test suite; reducing memory from 64MiB to
+// 8MiB and threads from 4 to 1 cuts each Unlock from ~300ms to ~5ms without
+// changing any security-relevant code paths.
+// NEVER use these parameters in production.
+func testConfig(dbPath string) Config {
+	return Config{
+		DBPath:                  dbPath,
+		VerifyArgon2Time:        1,
+		VerifyArgon2Memory:      8 * 1024,
+		VerifyArgon2Parallelism: 1,
+	}
+}
+
 func newTestStore(t testing.TB) *Keeper {
 	t.Helper()
-	s, err := New(Config{DBPath: filepath.Join(t.TempDir(), "secrets.db")})
+	s, err := New(testConfig(filepath.Join(t.TempDir(), "secrets.db")))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -136,7 +150,7 @@ func TestAutoLock_OnlyDropsAdminWrapped(t *testing.T) {
 
 func TestNew(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "secrets.db")
-	store, err := New(Config{DBPath: dbPath})
+	store, err := New(testConfig(dbPath))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -155,9 +169,9 @@ func TestNew(t *testing.T) {
 
 func TestOpenExisting(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "secrets.db")
-	s1, _ := New(Config{DBPath: dbPath})
+	s1, _ := New(testConfig(dbPath))
 	s1.Close()
-	s2, err := Open(Config{DBPath: dbPath})
+	s2, err := Open(testConfig(dbPath))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -168,7 +182,7 @@ func TestOpenExisting(t *testing.T) {
 }
 
 func TestOpen_NonExistent(t *testing.T) {
-	if _, err := Open(Config{DBPath: "/tmp/keeper_does_not_exist.db"}); err == nil {
+	if _, err := Open(testConfig("/tmp/keeper_does_not_exist.db")); err == nil {
 		t.Error("expected error for non-existent file")
 	}
 }
@@ -342,14 +356,14 @@ func TestAdminWrapped_RevokeAdmin(t *testing.T) {
 
 func TestAdminWrapped_PolicySurvivesReopen(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "s.db")
-	s1, _ := New(Config{DBPath: dbPath})
+	s1, _ := New(testConfig(dbPath))
 	s1.Unlock([]byte("masterpass"))
 	s1.CreateBucket("fin", "ns", LevelAdminWrapped, "test")
 	s1.AddAdminToPolicy("fin", "ns", "admin1", []byte("adminpass"))
 	s1.SetNamespacedFull("fin", "ns", "secret", []byte("value"))
 	s1.Close()
 
-	s2, err := Open(Config{DBPath: dbPath})
+	s2, err := Open(testConfig(dbPath))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -433,14 +447,14 @@ func TestRename(t *testing.T) {
 func TestCompareAndSwap(t *testing.T) {
 	store := newUnlockedStore(t)
 	store.Set("k", []byte("initial"))
-	if err := store.CompareAndSwap("k", "initial", "updated"); err != nil {
+	if err := store.CompareAndSwap("k", []byte("initial"), []byte("updated")); err != nil {
 		t.Fatalf("CAS: %v", err)
 	}
 	v, _ := store.Get("k")
 	if string(v) != "updated" {
 		t.Errorf("after CAS: %q", v)
 	}
-	if err := store.CompareAndSwap("k", "wrong", "x"); err != ErrCASConflict {
+	if err := store.CompareAndSwap("k", []byte("wrong"), []byte("x")); err != ErrCASConflict {
 		t.Errorf("bad old val: want ErrCASConflict, got %v", err)
 	}
 }
@@ -785,8 +799,10 @@ func (c *countingCipher) Decrypt(ct []byte) ([]byte, error) {
 	return out, nil
 }
 
+func (c *countingCipher) KeySize() int { return 32 }
+
 func BenchmarkSet(b *testing.B) {
-	store, _ := New(Config{DBPath: filepath.Join(b.TempDir(), "s.db")})
+	store, _ := New(testConfig(filepath.Join(b.TempDir(), "s.db")))
 	defer store.Close()
 	store.Unlock([]byte("pass"))
 	b.ResetTimer()
@@ -796,7 +812,7 @@ func BenchmarkSet(b *testing.B) {
 }
 
 func BenchmarkGet(b *testing.B) {
-	store, _ := New(Config{DBPath: filepath.Join(b.TempDir(), "s.db")})
+	store, _ := New(testConfig(filepath.Join(b.TempDir(), "s.db")))
 	defer store.Close()
 	store.Unlock([]byte("pass"))
 	store.Set("bench-key", []byte("bench-value"))

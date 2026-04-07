@@ -131,11 +131,11 @@ func TestChain_PruneEvents_HSM_Skipped(t *testing.T) {
 
 func TestChain_PolicySurvivesReopen(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "s.db")
-	s1, _ := New(Config{DBPath: dbPath})
+	s1, _ := New(testConfig(dbPath))
 	s1.Unlock([]byte("pass"))
 	s1.CreateBucket("ss", "ns", LevelPasswordOnly, "host")
 	s1.Close()
-	s2, err := Open(Config{DBPath: dbPath})
+	s2, err := Open(testConfig(dbPath))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
