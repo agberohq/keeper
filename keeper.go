@@ -618,6 +618,27 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 	s.auditEncKey = auditEncKey
 	s.auditStore.setEncKey(auditEncKey)
 
+	// Re-populate schemeRegistry now that policyEncKey is available.
+	// The initial loadPolicies() call in New() runs before unlock so it
+	// cannot decrypt encrypted policy values. We clear and reload here so
+	// all policies are fully decoded before bucket seeding proceeds.
+	s.registryMu.Lock()
+	s.schemeRegistry = make(map[string]*BucketSecurityPolicy)
+	s.registryMu.Unlock()
+	if err := s.loadPolicies(); err != nil {
+		s.locked = true
+		s.master = nil
+		s.auditStore.setSigningKey(nil)
+		s.auditStore.setEncKey(nil)
+		zero.Bytes(s.policyKey)
+		s.policyKey = nil
+		zero.Bytes(s.policyEncKey)
+		s.policyEncKey = nil
+		zero.Bytes(s.auditEncKey)
+		s.auditEncKey = nil
+		return fmt.Errorf("failed to load policies after unlock: %w", err)
+	}
+
 	// If a rotation was interrupted by a crash, complete it now.
 	// The master key has been verified, so we know it is the new key.
 	if s.hasIncompleteRotation() {
@@ -658,7 +679,11 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 		s.logger.Fields("err", err).Warn("policy HMAC upgrade failed — continuing")
 	}
 
-	// Seed all LevelPasswordOnly buckets.
+	// Seed all LevelPasswordOnly buckets by reading directly from the on-disk
+	// _policies_ bucket. This is authoritative: it does not rely on schemeRegistry
+	// being fully populated (which requires an in-memory round-trip through
+	// loadPolicies that can silently miss entries in some environments).
+	// The default bucket is always seeded first; remaining buckets follow.
 	if err := s.unlockBucketPasswordOnly(s.defaultScheme, s.defaultNs); err != nil {
 		s.locked = true
 		s.master = nil
@@ -672,26 +697,8 @@ func (s *Keeper) UnlockDatabase(master *Master) error {
 		s.auditEncKey = nil
 		return fmt.Errorf("failed to unlock default bucket: %w", err)
 	}
-	s.registryMu.RLock()
-	registrySnapshot := make([]*BucketSecurityPolicy, 0, len(s.schemeRegistry))
-	for _, p := range s.schemeRegistry {
-		registrySnapshot = append(registrySnapshot, p)
-	}
-	s.registryMu.RUnlock()
-	for _, policy := range registrySnapshot {
-		switch policy.Level {
-		case LevelPasswordOnly:
-			if err := s.unlockBucketPasswordOnly(policy.Scheme, policy.Namespace); err != nil {
-				s.audit("unlock_bucket_failed", policy.Scheme, policy.Namespace, "", false, 0)
-			}
-		case LevelHSM, LevelRemote:
-			if policy.HSMProvider != nil {
-				if err := s.unlockBucketHSM(policy.Scheme, policy.Namespace); err != nil {
-					s.logger.Fields("scheme", policy.Scheme, "namespace", policy.Namespace, "err", err).Warn("HSM bucket unlock failed — bucket remains locked")
-					s.audit("unlock_hsm_bucket_failed", policy.Scheme, policy.Namespace, "", false, 0)
-				}
-			}
-		}
+	if err := s.seedAllBucketsFromDisk(); err != nil {
+		s.logger.Fields("err", err).Warn("bucket seeding from disk encountered errors — some buckets may require explicit unlock")
 	}
 
 	s.updateActivity()

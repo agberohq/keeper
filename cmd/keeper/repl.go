@@ -98,6 +98,16 @@ func (s *replSession) dispatch(line string) (exit bool, err error) {
 	cmd := parts[0]
 	args := parts[1:]
 
+	// Strip surrounding quotes from each argument so users can type:
+	//   get "vault://system/key"  or  set 'vault://system/key' value
+	for i, a := range args {
+		if len(a) >= 2 {
+			if (a[0] == '"' && a[len(a)-1] == '"') || (a[0] == '\'' && a[len(a)-1] == '\'') {
+				args[i] = a[1 : len(a)-1]
+			}
+		}
+	}
+
 	switch cmd {
 	case "quit", "exit", "q":
 		fmt.Println("bye")
@@ -132,19 +142,26 @@ func (s *replSession) dispatch(line string) (exit bool, err error) {
 		err = s.cmds.Get(args[0])
 
 	case "set", "put":
-		// Value is prompted with no-echo so it never appears in terminal
-		// scrollback or shell history. The key is not a secret.
+		// set <key> [value]
+		// When value is supplied inline it is used directly (convenient for
+		// non-sensitive data). When omitted the value is prompted with no echo
+		// so it never appears in terminal scrollback or shell history.
 		if len(args) == 0 {
-			fmt.Fprintln(os.Stderr, "usage: set <key>")
+			fmt.Fprintln(os.Stderr, "usage: set <key> [value]")
 			return false, nil
 		}
 		key := args[0]
-		secret, e := prompter.NewSecret("Value for "+key, prompter.WithRequired(true)).Run()
-		if e != nil {
-			return false, e
+		if len(args) >= 2 {
+			// Inline value — join remaining args so "set key hello world" works.
+			err = s.cmds.Set(key, strings.Join(args[1:], " "), keepcmd.SetOptions{})
+		} else {
+			secret, e := prompter.NewSecret("Value for "+key, prompter.WithRequired(true)).Run()
+			if e != nil {
+				return false, e
+			}
+			defer secret.Zero()
+			err = s.cmds.Set(key, string(secret.Bytes()), keepcmd.SetOptions{})
 		}
-		defer secret.Zero()
-		err = s.cmds.Set(key, string(secret.Bytes()), keepcmd.SetOptions{})
 
 	case "delete", "rm", "del":
 		if len(args) == 0 {
@@ -238,7 +255,7 @@ func (s *replSession) printHelp() {
 Commands:
   ls  | list [s] [ns]   List all keys (optional: filter by scheme / namespace)
   cat | get  <key>       Read a secret value
-  put | set  <key>       Store a secret (value prompted hidden — not in scrollback)
+  put | set  <key> [val] Store a secret (omit value to prompt hidden — no scrollback)
   rm  | delete <key>     Remove a key (asks for confirmation)
   status                 Show lock state
   lock                   Lock the store (drops keys from memory)

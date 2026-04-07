@@ -408,7 +408,7 @@ func TestMigration_SurvivesReopen(t *testing.T) {
 
 	// First session: write secrets.
 	{
-		s, err := New(Config{DBPath: dbPath})
+		s, err := New(testConfig(dbPath))
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
@@ -429,7 +429,7 @@ func TestMigration_SurvivesReopen(t *testing.T) {
 
 	// Second session: migration should be marked done, data readable.
 	{
-		s, err := New(Config{DBPath: dbPath})
+		s, err := New(testConfig(dbPath))
 		if err != nil {
 			t.Fatalf("New (reopen): %v", err)
 		}

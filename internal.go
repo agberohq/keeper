@@ -65,45 +65,29 @@ func (s *Keeper) marshalPolicy(p *BucketSecurityPolicy) ([]byte, error) {
 var errPolicyEncrypted = stdErrors.New("policy is encrypted — key not available")
 
 // unmarshalPolicy decodes a BucketSecurityPolicy.
-// When policyEncKey is set, decryption is attempted first. When it is not set
-// and the blob looks like ciphertext (not JSON and not a msgpack map header),
-// errPolicyEncrypted is returned so the caller can skip the entry gracefully.
+//
+// Format v2 (the only supported format) always stores policies encrypted.
+// policyEncKey is required to read them — it is derived from the master key
+// and available only after UnlockDatabase.
+//
+// When policyEncKey is nil (pre-unlock), all blobs are unconditionally
+// skipped via errPolicyEncrypted. UnlockDatabase re-calls loadPolicies once
+// the key is available. There is no plaintext fallback: keeper is pre-release
+// and format v2 is the only on-disk format.
 func (s *Keeper) unmarshalPolicy(data []byte, p *BucketSecurityPolicy) error {
 	if len(data) == 0 {
 		return fmt.Errorf("unmarshalPolicy: empty data")
 	}
-	payload := data
-	// isCiphertext reports whether the first byte looks like a random nonce prefix
-	// rather than a structured plaintext encoding.
-	isCiphertext := func(b byte) bool {
-		isJSON := b == '{'
-		isMsgpackMap := b >= 0x80 && b <= 0x8f || b == 0xde || b == 0xdf
-		return !isJSON && !isMsgpackMap
+	if len(s.policyEncKey) == 0 {
+		// No key yet — all policies are encrypted, nothing is readable.
+		// UnlockDatabase will reload with the key.
+		return errPolicyEncrypted
 	}
-
-	if len(s.policyEncKey) > 0 {
-		// Key available: try decryption.
-		if dec, err := s.decryptMetadata(data, s.policyEncKey); err == nil {
-			payload = dec
-		} else if isCiphertext(data[0]) {
-			// Decryption failed and the blob looks like ciphertext. This should
-			// not happen with a correct key, but guard against it to prevent
-			// msgpack from receiving raw ciphertext and emitting a confusing error.
-			return fmt.Errorf("policy decryption failed (key mismatch or corrupt blob): %w", err)
-		}
-		// If decryption failed but the blob looks like plaintext (JSON/msgpack),
-		// fall through — the record was written before encryption was enabled.
-	} else {
-		// No key yet. Plaintext records start with '{' (JSON) or a msgpack map header.
-		// Anything else is ciphertext — skip it; UnlockDatabase will reload with the key.
-		if isCiphertext(data[0]) {
-			return errPolicyEncrypted
-		}
+	dec, err := s.decryptMetadata(data, s.policyEncKey)
+	if err != nil {
+		return fmt.Errorf("policy decryption failed: %w", err)
 	}
-	if len(payload) > 0 && payload[0] == '{' {
-		return json.Unmarshal(payload, p)
-	}
-	return msgpack.Unmarshal(payload, p)
+	return msgpack.Unmarshal(dec, p)
 }
 
 // marshalWAL encodes a RotationWAL using msgpack and encrypts it.
@@ -531,6 +515,14 @@ func (s *Keeper) reencryptAllWithKey(newKey, oldKey []byte) error {
 // resumeRotation continues an interrupted rotation automatically.
 // Called from UnlockDatabase when a WAL is present.
 // masterKey is the new master key (already verified by UnlockDatabase).
+//
+// In addition to completing any unfinished secret re-encryption, this
+// function re-encrypts all policy blobs from the old policyEncKey to the
+// current s.policyEncKey. This is necessary because a crash between
+// Rotate()'s reencryptAllWithKey and reencryptAllPolicies steps would
+// leave policy blobs encrypted under the old key. s.policyEncKey is already
+// set to the new-master-derived value by UnlockDatabase before we are called,
+// so we derive the old policyEncKey from oldKey to decrypt the stale blobs.
 func (s *Keeper) resumeRotation(masterKey []byte) error {
 	wal, err := s.readRotationWAL()
 	if err != nil {
@@ -554,7 +546,25 @@ func (s *Keeper) resumeRotation(masterKey []byte) error {
 	if err := s.encryptAllRecords(masterKey, oldKey, wal); err != nil {
 		return fmt.Errorf("re-encryption resume failed: %w", err)
 	}
-	return s.clearRotationWAL()
+	if err := s.clearRotationWAL(); err != nil {
+		return err
+	}
+
+	// Re-encrypt any policy blobs that were not yet migrated to the new key.
+	// Derive the old policyEncKey from the unwrapped old master key so we can
+	// decrypt blobs that may still be encrypted under it.
+	oldPolicyEncKey, _, err := deriveMetadataKeys(oldKey, s.config)
+	if err != nil {
+		return fmt.Errorf("resumeRotation: derive old policy enc key: %w", err)
+	}
+	defer zero.Bytes(oldPolicyEncKey)
+	if err := s.reencryptAllPolicies(oldPolicyEncKey); err != nil {
+		return fmt.Errorf("resumeRotation: policy re-encryption: %w", err)
+	}
+	if err := s.upgradePolicyHMACs(); err != nil {
+		s.logger.Fields("err", err).Warn("resumeRotation: policy HMAC upgrade failed — continuing")
+	}
+	return nil
 }
 
 // isHSMOrRemotePolicy returns true when the registered policy for the given
@@ -1190,11 +1200,163 @@ func (s *Keeper) appendAuditEvent(event *BucketEvent) error {
 	if s.config.Jack.Pool != nil && event.EventType != "created" {
 		ev := event
 		s.config.Jack.Pool.Do(func() {
-			_ = s.auditStore.appendEvent(ev.Scheme, ev.Namespace, ev)
+			if err := s.auditStore.appendEvent(ev.Scheme, ev.Namespace, ev); err != nil {
+				s.logger.Fields(
+					"scheme", ev.Scheme,
+					"namespace", ev.Namespace,
+					"event_type", ev.EventType,
+					"err", err,
+				).Error("async audit event failed")
+			}
 		})
 		return nil
 	}
 	return s.auditStore.appendEvent(event.Scheme, event.Namespace, event)
+}
+
+// reencryptAllPolicies re-encrypts every on-disk policy from oldEncKey to
+// the current s.policyEncKey. Call this immediately after swapping policyEncKey
+// during Rotate/RotateSalt so the next Unlock can decrypt with the new key.
+// Also called by resumeRotation to handle policies that were not yet migrated
+// when a process died mid-rotation.
+//
+// All work is done atomically: a single View reads and re-encrypts every blob
+// in memory, then a single Update writes all of them together. Either every
+// policy is migrated or none are — there is no WAL to resume a partial policy
+// re-encryption, so partial writes are treated as fatal errors.
+func (s *Keeper) reencryptAllPolicies(oldEncKey []byte) error {
+	type rewrite struct {
+		base    string
+		newData []byte
+	}
+	var rewrites []rewrite
+
+	// Phase 1: read every policy blob under the old key and re-encrypt it
+	// under the already-swapped s.policyEncKey (the new key). All work is
+	// done inside a single View so the snapshot is consistent.
+	if err := s.db.View(func(tx pkgstore.Tx) error {
+		b := tx.Bucket([]byte(policyBucket))
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
+			key := string(k)
+			if isPolicyHashKey(key) {
+				return nil
+			}
+			if v == nil {
+				// Nested bucket — should never appear in policyBucket, skip.
+				return nil
+			}
+			// Decrypt with the OLD key explicitly — s.policyEncKey is the new key.
+			plain, err := s.decryptMetadata(append([]byte(nil), v...), oldEncKey)
+			if err != nil {
+				return fmt.Errorf("reencryptAllPolicies: decrypt %q: %w", key, err)
+			}
+			var p BucketSecurityPolicy
+			if err := msgpack.Unmarshal(plain, &p); err != nil {
+				return fmt.Errorf("reencryptAllPolicies: unmarshal %q: %w", key, err)
+			}
+			// marshalPolicy encrypts with s.policyEncKey (the new key).
+			newData, err := s.marshalPolicy(&p)
+			if err != nil {
+				return fmt.Errorf("reencryptAllPolicies: re-encrypt %q: %w", key, err)
+			}
+			rewrites = append(rewrites, rewrite{key, newData})
+			return nil
+		})
+	}); err != nil {
+		return err
+	}
+
+	if len(rewrites) == 0 {
+		return nil
+	}
+
+	// Phase 2: write all re-encrypted blobs in a single atomic transaction.
+	// Either every policy is updated together or none are — there is no WAL
+	// to resume a partial policy re-encryption, so partial writes are fatal.
+	return s.db.Update(func(tx pkgstore.Tx) error {
+		b := tx.Bucket([]byte(policyBucket))
+		if b == nil {
+			return stdErrors.New("reencryptAllPolicies: policy bucket missing")
+		}
+		for _, rw := range rewrites {
+			if err := b.Put([]byte(rw.base), rw.newData); err != nil {
+				return fmt.Errorf("reencryptAllPolicies: write %q: %w", rw.base, err)
+			}
+			if err := b.Put([]byte(policyHashKey(rw.base)),
+				[]byte(policyHashIntegrity(rw.newData))); err != nil {
+				return fmt.Errorf("reencryptAllPolicies: write hash %q: %w", rw.base, err)
+			}
+			// Drop the stale HMAC tag — upgradePolicyHMACs (called after this
+			// function) recomputes it with the new policyKey.
+			_ = b.Delete([]byte(policyHMACKey(rw.base)))
+		}
+		return nil
+	})
+}
+
+// seedAllBucketsFromDisk reads every policy directly from the _policies_ bbolt
+// bucket and seeds or unlocks each bucket based on its security level.
+//
+// This is the authoritative seeding path used during UnlockDatabase. It does
+// NOT rely on schemeRegistry being populated first — it reads the encrypted
+// policy blobs from disk, decrypts them with the now-available policyEncKey,
+// and acts on each one. schemeRegistry is updated as a side-effect so that
+// subsequent lookups via loadPolicy benefit from the cache.
+//
+// LevelPasswordOnly: DEK derived and seeded into Envelope immediately.
+// LevelHSM / LevelRemote: unlocked via the registered HSMProvider if present.
+// LevelAdminWrapped: skipped — requires explicit UnlockBucket call per admin.
+func (s *Keeper) seedAllBucketsFromDisk() error {
+	var policies []*BucketSecurityPolicy
+
+	if err := s.db.View(func(tx pkgstore.Tx) error {
+		b := tx.Bucket([]byte(policyBucket))
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
+			if isPolicyHashKey(string(k)) {
+				return nil
+			}
+			var p BucketSecurityPolicy
+			if err := s.unmarshalPolicy(v, &p); err != nil {
+				s.logger.Fields("key", string(k), "err", err).Warn("seedAllBucketsFromDisk: skipping unreadable policy")
+				return nil // skip — do not abort; other buckets may be healthy
+			}
+			policies = append(policies, &p)
+			return nil
+		})
+	}); err != nil {
+		return fmt.Errorf("seedAllBucketsFromDisk: db read failed: %w", err)
+	}
+
+	for _, p := range policies {
+		// Update schemeRegistry so loadPolicy cache is warm.
+		registryKey := fmt.Sprintf("%s:%s", p.Scheme, p.Namespace)
+		s.registryMu.Lock()
+		s.schemeRegistry[registryKey] = p
+		s.registryMu.Unlock()
+
+		switch p.Level {
+		case LevelPasswordOnly:
+			if err := s.unlockBucketPasswordOnly(p.Scheme, p.Namespace); err != nil {
+				s.logger.Fields("scheme", p.Scheme, "namespace", p.Namespace, "err", err).Warn("seedAllBucketsFromDisk: failed to seed PasswordOnly bucket")
+				s.audit("unlock_bucket_failed", p.Scheme, p.Namespace, "", false, 0)
+			}
+		case LevelHSM, LevelRemote:
+			if p.HSMProvider != nil {
+				if err := s.unlockBucketHSM(p.Scheme, p.Namespace); err != nil {
+					s.logger.Fields("scheme", p.Scheme, "namespace", p.Namespace, "err", err).Warn("seedAllBucketsFromDisk: HSM bucket unlock failed")
+					s.audit("unlock_hsm_bucket_failed", p.Scheme, p.Namespace, "", false, 0)
+				}
+			}
+			// LevelAdminWrapped: intentionally skipped — requires per-admin credential.
+		}
+	}
+	return nil
 }
 
 func (s *Keeper) loadAuditChain(scheme, namespace string) ([]*BucketEvent, error) {
@@ -1425,7 +1587,11 @@ func (s *Keeper) runMigrationBatch(batchSize int) (complete bool, err error) {
 // is the number of records processed and done is true when the bucket is fully
 // migrated.
 func (s *Keeper) migrateBucket(scheme, namespace string, limit int) (n int, done bool, err error) {
+	// s.master is protected by s.mu. Hold RLock only for the memguard open+copy;
+	// the expensive bbolt work below must not hold it.
+	s.mu.RLock()
 	masterBytes, err := s.master.Bytes()
+	s.mu.RUnlock()
 	if err != nil {
 		return 0, false, err
 	}

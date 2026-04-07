@@ -87,11 +87,8 @@ func (s *Keeper) RotateSalt(passphrase []byte) error {
 		return fmt.Errorf("failed to store verification hash: %w", err)
 	}
 
-	newMaster, err := NewMaster(newKey)
-	if err != nil {
-		return fmt.Errorf("failed to create new master: %w", err)
-	}
-
+	// Derive all keys from newKey BEFORE NewMaster: memguard.NewEnclave wipes
+	// its input, so any derivation after NewMaster(newKey) uses zeroed bytes.
 	oldAuditKey, err := deriveAuditKey(oldKey)
 	if err != nil {
 		return fmt.Errorf("failed to derive old audit key: %w", err)
@@ -101,6 +98,29 @@ func (s *Keeper) RotateSalt(passphrase []byte) error {
 		zero.Bytes(oldAuditKey)
 		return fmt.Errorf("failed to derive new audit key: %w", err)
 	}
+	newPolicyKey, err := derivePolicyKey(newKey)
+	if err != nil {
+		zero.Bytes(oldAuditKey)
+		zero.Bytes(newAuditKey)
+		return fmt.Errorf("failed to derive new policy key: %w", err)
+	}
+	newPolicyEncKey, _, err := deriveMetadataKeys(newKey, s.config)
+	if err != nil {
+		zero.Bytes(oldAuditKey)
+		zero.Bytes(newAuditKey)
+		zero.Bytes(newPolicyKey)
+		return fmt.Errorf("failed to derive new policy encryption key: %w", err)
+	}
+
+	// Safe to call NewMaster now — this wipes newKey via memguard.
+	newMaster, err := NewMaster(newKey)
+	if err != nil {
+		zero.Bytes(oldAuditKey)
+		zero.Bytes(newAuditKey)
+		zero.Bytes(newPolicyKey)
+		zero.Bytes(newPolicyEncKey)
+		return fmt.Errorf("failed to create new master: %w", err)
+	}
 
 	s.appendRotationCheckpoints(oldAuditKey, newAuditKey)
 	zero.Bytes(oldAuditKey)
@@ -109,13 +129,16 @@ func (s *Keeper) RotateSalt(passphrase []byte) error {
 	s.master = newMaster
 	s.auditStore.setSigningKey(newAuditKey)
 	zero.Bytes(newAuditKey)
-
-	newPolicyKey, err := derivePolicyKey(newKey)
-	if err != nil {
-		return fmt.Errorf("failed to derive new policy key: %w", err)
-	}
+	oldPolicyEncKey := make([]byte, len(s.policyEncKey))
+	copy(oldPolicyEncKey, s.policyEncKey)
+	defer zero.Bytes(oldPolicyEncKey)
 	zero.Bytes(s.policyKey)
 	s.policyKey = newPolicyKey
+	zero.Bytes(s.policyEncKey)
+	s.policyEncKey = newPolicyEncKey
+	if err := s.reencryptAllPolicies(oldPolicyEncKey); err != nil {
+		return fmt.Errorf("policy re-encryption after salt rotation failed: %w", err)
+	}
 	if err := s.upgradePolicyHMACs(); err != nil {
 		s.logger.Fields("err", err).Warn("policy HMAC rewrite after salt rotation failed — continuing")
 	}
@@ -305,13 +328,8 @@ func (s *Keeper) Rotate(newPassphrase []byte) error {
 		return fmt.Errorf("failed to store verification hash: %w", err)
 	}
 
-	newMaster, err := NewMaster(newKey)
-	if err != nil {
-		return fmt.Errorf("failed to create new master: %w", err)
-	}
-
-	// Derive the old and new audit keys before swapping the master, so we
-	// can compute both fingerprints for the checkpoint event.
+	// Derive all keys from newKey BEFORE NewMaster: memguard.NewEnclave wipes
+	// its input, so any derivation after NewMaster(newKey) uses zeroed bytes.
 	oldAuditKey, err := deriveAuditKey(oldKey)
 	if err != nil {
 		return fmt.Errorf("failed to derive old audit key: %w", err)
@@ -321,10 +339,31 @@ func (s *Keeper) Rotate(newPassphrase []byte) error {
 		zero.Bytes(oldAuditKey)
 		return fmt.Errorf("failed to derive new audit key: %w", err)
 	}
+	newPolicyKey, err := derivePolicyKey(newKey)
+	if err != nil {
+		zero.Bytes(oldAuditKey)
+		zero.Bytes(newAuditKey)
+		return fmt.Errorf("failed to derive new policy key: %w", err)
+	}
+	newPolicyEncKey, _, err := deriveMetadataKeys(newKey, s.config)
+	if err != nil {
+		zero.Bytes(oldAuditKey)
+		zero.Bytes(newAuditKey)
+		zero.Bytes(newPolicyKey)
+		return fmt.Errorf("failed to derive new policy encryption key: %w", err)
+	}
+
+	// Safe to call NewMaster now — this wipes newKey via memguard.
+	newMaster, err := NewMaster(newKey)
+	if err != nil {
+		zero.Bytes(oldAuditKey)
+		zero.Bytes(newAuditKey)
+		zero.Bytes(newPolicyKey)
+		zero.Bytes(newPolicyEncKey)
+		return fmt.Errorf("failed to create new master: %w", err)
+	}
 
 	// Append a checkpoint event to every active chain, signed with the old key.
-	// This is O(number of chains) — one small event per chain regardless of
-	// how many events are in the chain.
 	s.appendRotationCheckpoints(oldAuditKey, newAuditKey)
 	zero.Bytes(oldAuditKey)
 
@@ -333,15 +372,19 @@ func (s *Keeper) Rotate(newPassphrase []byte) error {
 	s.master = newMaster
 	s.auditStore.setSigningKey(newAuditKey)
 	zero.Bytes(newAuditKey)
-
-	// Re-derive the policy HMAC key from the new master and rewrite all
-	// policy records with the new tag.
-	newPolicyKey, err := derivePolicyKey(newKey)
-	if err != nil {
-		return fmt.Errorf("failed to derive new policy key: %w", err)
-	}
+	// Capture the old encryption key before swapping — reencryptAllPolicies needs
+	// it to decrypt the on-disk blobs that were written with the old key.
+	oldPolicyEncKey := make([]byte, len(s.policyEncKey))
+	copy(oldPolicyEncKey, s.policyEncKey)
+	defer zero.Bytes(oldPolicyEncKey)
+	// Swap keys: marshalPolicy will now use the new policyEncKey.
 	zero.Bytes(s.policyKey)
 	s.policyKey = newPolicyKey
+	zero.Bytes(s.policyEncKey)
+	s.policyEncKey = newPolicyEncKey
+	if err := s.reencryptAllPolicies(oldPolicyEncKey); err != nil {
+		return fmt.Errorf("policy re-encryption after rotation failed: %w", err)
+	}
 	if err := s.upgradePolicyHMACs(); err != nil {
 		s.logger.Fields("err", err).Warn("policy HMAC rewrite after rotation failed — continuing")
 	}

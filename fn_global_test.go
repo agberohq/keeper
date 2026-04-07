@@ -97,7 +97,7 @@ func TestGlobalClear_IdempotentOnNil(t *testing.T) {
 // would use a closed store. With GlobalClear the call errors cleanly.
 func TestGlobalClear_AfterClose(t *testing.T) {
 	// Create store without the t.Cleanup auto-close so we control timing.
-	s, err := New(Config{DBPath: t.TempDir() + "/gc.db"})
+	s, err := New(testConfig(t.TempDir() + "/gc.db"))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

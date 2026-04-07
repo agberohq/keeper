@@ -70,6 +70,13 @@ func (c *Commands) List(filter ...string) error {
 
 	var rows [][]string
 
+	// formatKey returns the canonical display form of a key.
+	// All schemes use scheme://namespace/key so the output is copy-pasteable
+	// directly back into get/set/delete commands.
+	formatKey := func(scheme, ns, key string) string {
+		return scheme + "://" + ns + "/" + key
+	}
+
 	switch len(filter) {
 	case 0:
 		// All schemes → all namespaces → all keys.
@@ -88,7 +95,7 @@ func (c *Commands) List(filter ...string) error {
 					return fmt.Errorf("list %s/%s: %w", scheme, ns, err)
 				}
 				for _, k := range keys {
-					rows = append(rows, []string{scheme + "/" + ns + "/" + k})
+					rows = append(rows, []string{formatKey(scheme, ns, k)})
 				}
 			}
 		}
@@ -105,7 +112,7 @@ func (c *Commands) List(filter ...string) error {
 				return fmt.Errorf("list %s/%s: %w", scheme, ns, err)
 			}
 			for _, k := range keys {
-				rows = append(rows, []string{ns + "/" + k})
+				rows = append(rows, []string{formatKey(scheme, ns, k)})
 			}
 		}
 	default:
@@ -116,7 +123,7 @@ func (c *Commands) List(filter ...string) error {
 			return fmt.Errorf("list %s/%s: %w", scheme, ns, err)
 		}
 		for _, k := range keys {
-			rows = append(rows, []string{k})
+			rows = append(rows, []string{formatKey(scheme, ns, k)})
 		}
 	}
 

@@ -173,7 +173,7 @@ func TestRotateAdminWrappedDEK_SurvivesReopen(t *testing.T) {
 
 	// First session: create bucket, add admins, rotate Alice.
 	{
-		s, err := New(Config{DBPath: dbPath})
+		s, err := New(testConfig(dbPath))
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
@@ -189,7 +189,7 @@ func TestRotateAdminWrappedDEK_SurvivesReopen(t *testing.T) {
 
 	// Second session: Bob must still be able to unlock.
 	{
-		s, err := New(Config{DBPath: dbPath})
+		s, err := New(testConfig(dbPath))
 		if err != nil {
 			t.Fatalf("New (reopen): %v", err)
 		}

@@ -21,18 +21,48 @@ type Output interface {
 // standalone binary when not in interactive/TUI mode.
 type PlainOutput struct{}
 
-// Table renders headers and rows as a simple fixed-width table.
+// Table renders headers and rows as a dynamic-width table.
+// Column widths are computed from the actual content so long keys
+// (e.g. vault://system/jwt_secret) are never truncated or padded excessively.
 func (p PlainOutput) Table(headers []string, rows [][]string) {
+	if len(headers) == 0 && len(rows) == 0 {
+		return
+	}
+
+	// Compute column widths: max of header width and widest cell.
+	ncols := len(headers)
+	for _, row := range rows {
+		if len(row) > ncols {
+			ncols = len(row)
+		}
+	}
+	widths := make([]int, ncols)
+	for i, h := range headers {
+		widths[i] = len(h)
+	}
+	for _, row := range rows {
+		for i, cell := range row {
+			if i < ncols && len(cell) > widths[i] {
+				widths[i] = len(cell)
+			}
+		}
+	}
+
 	if len(headers) > 0 {
 		for i, h := range headers {
 			if i > 0 {
 				fmt.Print("  ")
 			}
-			fmt.Printf("%-30s", h)
+			fmt.Printf("%-*s", widths[i], h)
 		}
 		fmt.Println()
-		for range headers {
-			fmt.Printf("%-30s", "──────────────────────────────")
+		for i, w := range widths {
+			if i > 0 {
+				fmt.Print("  ")
+			}
+			for j := 0; j < w; j++ {
+				fmt.Print("─")
+			}
 		}
 		fmt.Println()
 	}
@@ -41,7 +71,11 @@ func (p PlainOutput) Table(headers []string, rows [][]string) {
 			if i > 0 {
 				fmt.Print("  ")
 			}
-			fmt.Printf("%-30s", cell)
+			if i < ncols {
+				fmt.Printf("%-*s", widths[i], cell)
+			} else {
+				fmt.Print(cell)
+			}
 		}
 		fmt.Println()
 	}
