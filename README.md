@@ -1,3 +1,5 @@
+> WARNING: This project is under active development & review
+
 # keeper
 
 Keeper is a cryptographic secret store for Go. It encrypts arbitrary byte
