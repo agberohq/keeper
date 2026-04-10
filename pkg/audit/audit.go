@@ -139,8 +139,11 @@ func (e *Event) ComputeHMAC(key []byte) string {
 // VerifyHMAC returns true when the event's HMAC is valid for key.
 // Returns true unconditionally when key or e.HMAC is empty.
 func (e *Event) VerifyHMAC(key []byte) bool {
-	if len(key) == 0 || e.HMAC == "" {
-		return true
+	if len(key) == 0 {
+		return true // No key available
+	}
+	if e.HMAC == "" {
+		return false
 	}
 	return hmac.Equal([]byte(e.HMAC), []byte(e.ComputeHMAC(key)))
 }
