@@ -1,5 +1,3 @@
-> WARNING: This project is under active development & review
-
 # keeper
 
 Keeper is a cryptographic secret store for Go. It encrypts arbitrary byte
@@ -45,11 +43,15 @@ Keeper partitions secrets into buckets. Every bucket has an immutable
 `BucketSecurityPolicy` that governs how its Data Encryption Key (DEK) is
 protected. Four levels are available.
 
-The URI scheme (`vault://`, `certs://`, `space://`, or any name you register)
-is independent of the security level. A scheme is just a namespace prefix that
-groups related buckets. The security level is a property of the
-`BucketSecurityPolicy` set at `CreateBucket` time and cannot be changed
-afterwards. You can mix security levels freely within the same scheme.
+### Schemes vs. Security Levels
+
+A **scheme** is a URI prefix that groups related buckets (`vault://`, `certs://`,
+`space://`, or any name you register). A **security level** is a property of the
+bucket policy set at creation and immutable thereafter.
+
+You can mix security levels freely within the same scheme. For example,
+`vault://system` might be `LevelPasswordOnly` (auto-unlocked at startup), while
+`vault://admin` is `LevelAdminWrapped` (requires explicit credential).
 
 ### LevelPasswordOnly
 
@@ -145,9 +147,9 @@ was already produced by a high-cost KDF; a second Argon2 invocation would add
 hundreds of milliseconds of latency to every `UnlockBucket` call with no
 security benefit. HKDF-SHA256 operates in approximately one microsecond.
 
-The neither-alone property holds: an attacker who compromises only the database
-obtains the wrapped DEK and the HKDF salt but cannot derive the KEK without the
-master key. An attacker who compromises only the master key cannot unwrap any
+**Defense-in-depth:** An attacker who compromises only the database obtains the
+wrapped DEK and the HKDF salt but cannot derive the KEK without the master key.
+An attacker who compromises only the master key cannot unwrap any
 `LevelAdminWrapped` DEK without also knowing the admin credential.
 
 ### Metadata encryption — secrets
@@ -164,6 +166,12 @@ For `LevelAdminWrapped`, `LevelHSM`, and `LevelRemote` buckets this means
 metadata is inaccessible without the bucket credential, preventing an attacker
 with read access to the database file from learning access patterns or
 timestamps.
+
+**Timing side-channel note:** XChaCha20-Poly1305 processes the full ciphertext
+before returning an authentication error. The fallback decrypt path (new
+derived DEK → old master-key-as-DEK) takes the same wall-clock time regardless
+of which key succeeds. No timing side-channel leaks the migration state of a
+record.
 
 ### Metadata encryption — policies, WAL, and audit
 
@@ -314,6 +322,11 @@ without any key:
 | Audit-key holder | `auditEncKey` | Full chain + decrypt Scheme/Namespace/Details |
 | Operator | Master passphrase | Everything |
 
+**Example:** A compliance auditor receives only `auditEncKey`. They can verify
+the full HMAC chain across key rotations and read all event details, but cannot
+decrypt any secret values. A public observer with only the database file can
+still detect if any event was modified or inserted after the fact.
+
 ### Versioned salt store
 
 The KDF salt is stored as a msgpack-encoded `SaltStore` under the `salt`
@@ -363,10 +376,20 @@ this setting.
 
 Jack is an optional process supervision library. When a `JackConfig` is
 provided via `WithJack`, keeper activates background components automatically:
-auto-lock Looper, per-bucket DEK Reaper, health monitoring patients (bbolt
-read latency + encrypt/decrypt round-trip), audit prune scheduler, and async
-event Pool. Keeper never calls `pool.Shutdown` — the pool lifecycle belongs to
-the caller.
+
+- **Auto-lock Looper:** Periodically checks the last activity timestamp and
+  drops `LevelAdminWrapped` bucket DEKs after `AutoLockInterval`. `LevelPasswordOnly`
+  buckets remain unlocked so background jobs continue uninterrupted. The
+  single-write-lock pattern inside the looper task eliminates the `RUnlock→Lock`
+  race condition present in earlier designs.
+- **Per-bucket DEK Reaper:** TTL-based expiration for `LevelAdminWrapped` DEKs.
+- **Health monitoring patients:** bbolt read latency check and encrypt/decrypt
+  round-trip verification, both registered with `jack.Doctor`.
+- **Audit prune scheduler:** Periodic `PruneEvents` on all non-HSM buckets.
+- **Async event Pool:** Audit events submitted without blocking the main operation.
+
+If `JackConfig` is not provided, keeper runs without these background tasks.
+Keeper never calls `pool.Shutdown` — the pool lifecycle belongs to the caller.
 
 ---
 
@@ -476,6 +499,10 @@ keephandler.Mount(mux, store,
 body. `false` (default) costs one lightweight `statusWriter` wrapper;
 `true` buffers the full body into a `bytes.Buffer` for the `AfterFunc` — one
 allocation per request.
+
+Hooks are executed in registration order. Multiple `WithHooks` calls are
+additive. Only the first hook registered for a given route name is used—subsequent
+registrations for the same route are ignored.
 
 ---
 
@@ -610,6 +637,9 @@ info, err := store.Backup(f)
 
 ## Error catalogue
 
+All sentinel errors work with `errors.Is` and `errors.As`. Stack traces are
+captured at the point of creation via `github.com/olekukonko/errors`.
+
 | Error | Meaning |
 |---|---|
 | `ErrStoreLocked` | Operation attempted while the store is locked |
@@ -638,7 +668,12 @@ info, err := store.Backup(f)
 an unknown admin ID and a wrong password return `ErrAuthFailed`. This prevents
 admin ID enumeration by timing or error-string comparison. `RevokeAdmin` retains
 `ErrAdminNotFound` because it is an administrative operation on an
-already-unlocked store.
+already-unlocked store. The constant-time comparison for admin ID presence is
+intentionally omitted. An attacker who can measure sub-microsecond differences
+in bbolt bucket lookups would need local filesystem access—at which point they
+can read the policy bucket directly. The threat model assumes the database file
+may be compromised; timing defense against remote enumeration is the primary
+concern.
 
 **Argon2id dominates timing.** Argon2id takes 200–500 ms on typical hardware.
 Post-derivation comparison differences are four or more orders of magnitude

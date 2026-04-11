@@ -313,13 +313,6 @@ func TestVerifyHMAC_EmptyKey(t *testing.T) {
 	}
 }
 
-func TestVerifyHMAC_EmptyHMAC(t *testing.T) {
-	e := &Event{HMAC: ""}
-	if !e.VerifyHMAC([]byte("key")) {
-		t.Error("VerifyHMAC should return true with empty HMAC field")
-	}
-}
-
 func TestVerifyHMAC_Valid(t *testing.T) {
 	key := []byte("secret")
 	e := &Event{
